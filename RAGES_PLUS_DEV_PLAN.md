@@ -4,6 +4,15 @@ This document summarizes the development procedure for the bootstrapped, bottom-
 
 IMPORTANT: this is a research codebase for prototyping, so simplicity / readability of the codebase is critical, rather than a lot of assertions. Prioritize the simplicity of the overall code organization.
 
+## Important: Overall contribution of the paper
+
+1. Development of the intermediate representation (IR) and decomposition (behavior graph and waypoint constriants) in order to make a intent (free-form text)-to-trajectory pipeline 
+
+2. Scalable dataset generation in the dataset-limited world: behavior-graph walking based sampling technique 
+
+3. Demonstration that the proposed method can (i) trace the mission designer's intent and better than other heuristic methods. 
+
+
 ## 0. Core design decision
 
 Use a **sigma-free verifier surrogate**:
@@ -81,12 +90,41 @@ Reusable v1 components:
 
 - behavior vocabulary and campaign graph: `src/parameters.py`,
 - graph and scenario sampling utilities: `work/datagen_wyp.py`,
+- explicit RAGES+ action schema and deterministic sampler: `src/parameters.py`, `src/rages_sampling.py`,
 - waypoint model baseline training: `work/train_wyp_predictor.py`,
 - frozen-waypoint candidate rollout and SCP metric computation: `work/datagen_reasoning.py`,
 - reasoning SFT baseline: `work/train_reasoning_model.py`,
 - end-to-end smoke wrapper: `src/rages.py`.
 
 RAGES+ should reuse these components, but it should introduce explicit library-level interfaces for `Scenario`, `IR`, `Action`, `WaypointPlan`, `VerifierResult`, `QOutput`, and artifact versions. The current scripts can remain as v1 baselines, while new RAGES+ modules should avoid depending on ad hoc JSON rows or script-local globals.
+
+### 1.2 Action schema contract
+
+The inference-time action is strictly:
+
+```text
+a = (b_seq, tof_steps)
+```
+
+implemented as `Action` in `src/parameters.py`.
+
+Do **not** include `policy`, `dt_orbits`, transfer windows, or target-domain traces in the action. Those fields are data-curation metadata used to generate scalable supervision without expert labels. They may be stored with training samples for auditability and regeneration, but the policy and Q model should treat the action only as `(b_seq, tof_steps)`.
+
+Current separation:
+
+```text
+Action:
+  b_seq
+  tof_steps
+
+ActionCurationMetadata:
+  policy
+  dt_orbits
+  dt_ranges
+  target_domains
+```
+
+This distinction matters because campaign `policy` is a curation mechanism, not an inference-time decision variable. At deployment, RAGES+ should not require selecting or exposing the campaign policy that happened to generate a training sample.
 
 ## 2. Stage 0 — Samplers
 
@@ -159,6 +197,13 @@ A_mask(s, IR)
 ```
 
 They do not enter `Q_psi`.
+
+Current status (v0): the IR-derived hard filter is a pass-all placeholder
+(`hard_filter_pass_all` in `src/rages_scoring.py`). Grammar, precedence, and
+window validity are already enforced by the behavior-graph sampler / action
+mask, so the v0 filter admits every mask-valid candidate. IR-derived hard
+constraints (forbidden windows, budgets, terminal-domain prohibitions) plug in
+later by replacing this function without touching the ranking path.
 
 ### 3.2 Soft preferences
 
@@ -463,6 +508,59 @@ rho_sigma decides what is preferred.
 
 This separation is central to the method.
 
+### 6.3 Initial realization (v0): tolerance-based lexicographic ranking
+
+The first `rho_sigma` is an ordering, not a scalar score. This is sufficient
+because every downstream consumer (group-relative GRPO advantages, top-1
+selection, within-group Kendall tau) only needs ranks. Implementation:
+`src/rages_scoring.py`.
+
+Definition: metrics are compared in intent-priority order; two candidates are
+tied on metric `m_k` when
+
+```text
+|m_k(i) - m_k(j)| <= eps_k
+```
+
+and the comparison falls through to the next-priority metric.
+
+Implementation detail: pairwise tolerance ties are not transitive, so each
+metric is instead quantized into eps-width buckets,
+
+```text
+key_k = floor(m_k / eps_k)        (sign-flipped for max-metrics)
+```
+
+and candidates are sorted by the lexicographic key tuple. This keeps the
+order total, deterministic, and per-candidate (each key is computable
+independently of the candidate group, matching the per-candidate
+`rho_sigma(Q_psi(s, a))` interface). Two values within `eps_k` of each other
+can still straddle a bucket boundary; the deviation from the pairwise
+definition is bounded to one bucket. `eps_k = 0` gives strict comparison and
+recovers the v1 `rank_det` behavior in `work/datagen_reasoning.py`.
+
+Sigma parameterization under this realization:
+
+```text
+sigma = (priority permutation, eps vector, p_conv feasibility threshold)
+```
+
+All three are samplable by the IR sampler (priority permutations and
+threshold settings, cf. Sec. 2.2). Feasibility is the first lexicographic
+key: with true-SCP labels it is the converged flag; with Q outputs it is
+`p_conv >= threshold`, where the threshold is a sigma-level risk-tolerance
+parameter. Infeasible candidates rank after all feasible ones, and candidates
+with non-finite metrics rank after all fully valid ones.
+
+The default eps values in `rages_scoring.DEFAULT_EPSILONS` are placeholders;
+once the Stage 2 candidate dataset exists, recalibrate them per metric as a
+fraction of the median within-scenario candidate spread
+(`epsilons_from_metric_spread`).
+
+Scalar forms of `rho_sigma` (weighted utility, LCB) remain available as later
+variants and as the scalarization baseline in the main experiments (Sec. 13);
+they do not change the Q interface.
+
 ## 7. Stage 3a — Format SFT
 
 ### 7.1 Purpose
@@ -708,11 +806,11 @@ Critical invalidation rules:
 
 Recommended development order:
 
-1. Promote the existing behavior vocabulary and campaign graph in `src/parameters.py` into an explicit action schema.
-2. Promote the existing scenario sampling logic in `work/datagen_wyp.py` into a deterministic scenario sampler with split metadata.
-3. Implement IR sampler.
+1. Done: promote the existing behavior vocabulary and campaign graph in `src/parameters.py` into an explicit action schema. `Action` contains only `b_seq` and `tof_steps`; curation-only fields live in `ActionCurationMetadata`.
+2. Done: promote the existing scenario sampling logic in `work/datagen_wyp.py` into a deterministic scenario sampler with split metadata. The initial implementation is `src/rages_sampling.py`.
+3. Done: implement deterministic IR sampler for training. The implementation is in `src/rages_sampling.py` and samples structured `IR = (sigma, dz, g, filters)` without using raw text or an LLM.
 4. Implement hard filter and token/action mask builder using the existing graph-validity utilities as the first backend.
-5. Promote `generate_traj_with_wyp` and `compute_metrics` from `work/datagen_reasoning.py` into an SCP verifier wrapper with deterministic logging.
+5. Done: promote `generate_traj_with_wyp` and `compute_metrics` from `work/datagen_reasoning.py` into a thin SCP verifier wrapper with deterministic logging. The wrapper is `verify_waypoint_plan` in `src/rages_sampling.py`; scoring-side extraction helpers are in `src/rages_scoring.py`.
 6. Generate initial SCP rollout dataset using the current `work/datagen_wyp.py` workflow.
 7. Train the current GMM/VAE `p_phi` baseline using reward-weighted MLE.
 8. Train the RAGES+ flow-matching `p_phi` candidate and compare it against the GMM baseline.
@@ -720,7 +818,7 @@ Recommended development order:
 10. Generate Stage 2 candidate dataset using frozen `p_phi + SCP`.
 11. Train censoring-aware `Q_psi(s, a)`.
 12. Build Q calibration/ranking fixture.
-13. Implement `rho_sigma(Q)` external scoring.
+13. Done (v0): implement `rho_sigma(Q)` external scoring. The initial realization is the tolerance-based lexicographic ranking and pass-all hard filter in `src/rages_scoring.py` (cf. Sec. 6.3); it currently consumes metric dicts and a feasibility flag, so wiring to Q outputs (`p_conv` thresholding, metric means) remains once `Q_psi` exists.
 14. Train Stage 3a structured SFT policy.
 15. Implement masked group sampling.
 16. Implement Stage 3b GRPO using Q-based group rewards.
@@ -731,6 +829,59 @@ Recommended development order:
 ## 12.1 Repository workflow and validation pipeline
 
 Use the current repository as the v1 baseline and add RAGES+ stages incrementally.
+
+### Action schema and deterministic sampler validation
+
+Purpose: verify that the RAGES+ action schema and deterministic sampler are usable without loading neural models or running SCP.
+
+Expected workflow:
+
+```text
+PYTHONPATH=src python3 - <<'PY'
+from rages_sampling import SplitConfig, sample_curated_rollout, sample_curated_rollouts
+
+sample = sample_curated_rollout(0, seed=7, split="train")
+print(sample.action.to_dict())
+print(sample.curation.to_dict())
+print([x.scenario.split for x in sample_curated_rollouts(
+    5,
+    seed=7,
+    split_config=SplitConfig(train=0.6, val=0.2, test=0.2),
+)])
+PY
+```
+
+Required checks:
+
+- `sample.action` contains only `b_seq` and `tof_steps`,
+- `sample.curation` contains `policy`, `dt_orbits`, `dt_ranges`, and `target_domains`,
+- repeated calls with the same `sample_id` and `seed` produce the same result,
+- split labels are assigned from `SplitConfig`.
+
+### IR sampler validation
+
+Purpose: verify that training-time IRs are sampled as structured data without calling an LLM or consuming raw text.
+
+Expected workflow:
+
+```text
+PYTHONPATH=src python3 - <<'PY'
+from rages_sampling import sample_curated_rollout, sample_ir, sample_ir_batch
+
+rollout = sample_curated_rollout(0, seed=7, split="train")
+ir = sample_ir(0, seed=11, scenario=rollout.scenario, split="train", profile="auto")
+print(ir.to_dict())
+print([x.profile for x in sample_ir_batch(5, seed=11)])
+PY
+```
+
+Required checks:
+
+- `ir.ir.sigma.priority` is a permutation of `fuel`, `time`, `observation`, and `safety_margin`,
+- `ir.ir.dz` contains terminal-domain or direction intent,
+- `ir.ir.g.task_class` is one of the supported task classes,
+- `ir.ir.filters` contains only structured hard-filter fields,
+- repeated calls with the same `sample_id`, `seed`, and `profile` produce the same result.
 
 ### V1 smoke and artifact validation
 
@@ -912,6 +1063,21 @@ Keep these invariants throughout implementation:
 ```
 
 
-## 16. Note 
+## 16. Implementation status
 
-Record the edits in this section when you complete the agenda in Sec. 12 to track the high-level change. 
+Use this section to track completion of the agenda in Sec. 12.
+
+Current validation status:
+
+- Items 1--3 validated with lightweight deterministic sampler smoke tests.
+- Item 5 validated with import/compile checks and a lightweight wrapper/scoring extraction smoke test. Full SCP execution is intentionally left to the Stage 2 rollout pipeline because it invokes the heavy solver stack.
+- Next structural target is item 6: generate the initial SCP rollout dataset using the current waypoint-data workflow and the thin verifier wrapper.
+
+| Sec. 12 item | Status | Implementation / notes |
+| --- | --- | --- |
+| 1. Behavior vocabulary and action schema | Done | Added `Action`, `ActionCurationMetadata`, and `CuratedAction` in `src/parameters.py`. `Action` is strictly `(b_seq, tof_steps)`; `policy`, `dt_orbits`, transfer windows, and target-domain traces are curation metadata only. |
+| 2. Deterministic scenario sampler with split metadata | Done | Added `src/rages_sampling.py` with `SplitConfig`, `ScenarioSample`, `ScenarioRolloutSample`, `sample_curated_rollout`, and `sample_curated_rollouts`. |
+| 3. IR sampler | Done | Added IR dataclasses and deterministic training sampler in `src/rages_sampling.py`: `IRSigma`, `IRDeltaZ`, `IRGoal`, `IRFilters`, `IR`, `IRSample`, `sample_ir`, `sample_ir_batch`, and `enumerate_priority_profiles`. This sampler is structured and LLM-free; raw-text parsing remains a separate parser workstream. |
+| 4. Hard filter and token/action mask builder | Partial | IR-derived hard filter is the v0 pass-all placeholder `hard_filter_pass_all` in `src/rages_scoring.py` (cf. Sec. 3.1); grammar/admissibility stays with the behavior-graph sampler. Token/action mask builder not started. |
+| 5. SCP verifier wrapper with deterministic logging | Done (thin wrapper) | Added `WaypointPlan`, `SCPVerifierConfig`, `SCPVerifierResult`, and `verify_waypoint_plan` in `src/rages_sampling.py`. The wrapper lazy-loads the existing `generate_traj_with_wyp` SCP backend without changing solver behavior. Migrated `compute_obs_score` and `compute_metrics` into `src/rages_scoring.py`, alongside `verifier_metric_row`, `verifier_feasible`, and `verifier_scoring_inputs`, so verifier outputs can feed `rho_sigma`. |
+| 13. External scoring `rho_sigma(Q)` | Done (v0) | Added `src/rages_scoring.py`: tolerance-based lexicographic ranking (`LexicographicPreference`, `lexicographic_key`, `rank_candidates`, `select_best`) with epsilon-bucket quantization for transitivity, plus `epsilons_from_metric_spread` for tolerance calibration (cf. Sec. 6.3). `eps = 0` recovers v1 `rank_det`. Consumes metric dicts + feasibility flag now; wiring to `Q_psi` outputs (`p_conv` threshold, metric means) pending Stage 2. Default epsilons are placeholders pending calibration on Stage 2 data. |

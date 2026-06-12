@@ -61,24 +61,104 @@ Range = Tuple[float, float]
 MultiRange = Union[Range, Sequence[Range]]
 
 
+@dataclass(frozen=True)
+class Action:
+    """
+    Inference-time behavior action.
+
+    This is intentionally limited to the learned guidance action:
+    behavior sequence and total time of flight in discrete steps.
+    Campaign policy names and per-phase dt_orbits are data-curation
+    metadata only; they must not be treated as inference-time action
+    fields for RAGES+.
+    """
+
+    b_seq: Tuple[int, ...]
+    tof_steps: int
+
+    def __post_init__(self) -> None:
+        b_seq = tuple(int(b) for b in self.b_seq)
+        tof_steps = int(self.tof_steps)
+        if len(b_seq) == 0:
+            raise ValueError("Action.b_seq must be non-empty.")
+        invalid = [b for b in b_seq if b not in BEHAVIOR_IDS]
+        if invalid:
+            raise ValueError(f"Unknown behavior id(s): {invalid}")
+        if tof_steps <= 0:
+            raise ValueError("Action.tof_steps must be positive.")
+        object.__setattr__(self, "b_seq", b_seq)
+        object.__setattr__(self, "tof_steps", tof_steps)
+
+    @classmethod
+    def from_values(cls, b_seq: Sequence[int], tof_steps: int) -> "Action":
+        return cls(b_seq=tuple(int(b) for b in b_seq), tof_steps=int(tof_steps))
+
+    def to_dict(self) -> Dict[str, object]:
+        return {
+            "b_seq": [int(b) for b in self.b_seq],
+            "tof_steps": int(self.tof_steps),
+        }
+
+
+@dataclass(frozen=True)
+class ActionCurationMetadata:
+    """
+    Data-curation metadata used to synthesize scalable supervision.
+
+    `policy`, `dt_orbits`, transfer windows, and target domains explain how
+    a training sample was generated. They are useful for audits and dataset
+    regeneration, but they are deliberately not part of `Action`.
+    """
+
+    policy: str
+    dt_orbits: Tuple[float, ...]
+    dt_ranges: Tuple[Range, ...]
+    target_domains: Tuple[str, ...]
+
+    def to_dict(self) -> Dict[str, object]:
+        return {
+            "policy": self.policy,
+            "dt_orbits": [float(x) for x in self.dt_orbits],
+            "dt_ranges": [[float(lo), float(hi)] for lo, hi in self.dt_ranges],
+            "target_domains": list(self.target_domains),
+        }
+
+
+@dataclass(frozen=True)
+class CuratedAction:
+    """Action plus training-only curation metadata."""
+
+    action: Action
+    curation: ActionCurationMetadata
+
+
 @dataclass
 class NodeVolume:
     name: str
     d_lambda_range: Range
     d_ex_range: MultiRange
 
-    def _sample_range(self, r: MultiRange, n: int = 5) -> float:
+    def _sample_range(
+        self,
+        r: MultiRange,
+        n: int = 5,
+        rng: Optional[np.random.Generator] = None,
+    ) -> float:
         if isinstance(r[0], (list, tuple)):
-            lo, hi = r[np.random.randint(len(r))]
+            idx = int(np.random.randint(len(r))) if rng is None else int(rng.integers(len(r)))
+            lo, hi = r[idx]
         else:
             lo, hi = r
-        return float(np.random.choice(np.linspace(lo, hi, n)))
+        grid = np.linspace(lo, hi, n)
+        if rng is None:
+            return float(np.random.choice(grid))
+        return float(grid[int(rng.integers(len(grid)))])
 
-    def sample(self) -> np.ndarray:
+    def sample(self, rng: Optional[np.random.Generator] = None) -> np.ndarray:
         da = 0.0
-        dl = self._sample_range(self.d_lambda_range)
+        dl = self._sample_range(self.d_lambda_range, rng=rng)
         dex = 0.0
-        dey = self._sample_range(self.d_ex_range)
+        dey = self._sample_range(self.d_ex_range, rng=rng)
         dix = 0.0
         diy = dey
         return np.array([da, dl, dex, dey, dix, diy])
@@ -100,11 +180,17 @@ class MissionPolicy:
     def get_next_options(self, current_node: str, step_index: int) -> List[Tuple[str, int, Tuple[float, float]]]:
         raise NotImplementedError
 
-    def get_next_step(self, current_node: str, step_index: int) -> Optional[Tuple[str, int, Tuple[float, float]]]:
+    def get_next_step(
+        self,
+        current_node: str,
+        step_index: int,
+        rng: Optional[np.random.Generator] = None,
+    ) -> Optional[Tuple[str, int, Tuple[float, float]]]:
         options = self.get_next_options(current_node, step_index)
         if not options:
             return None
-        return options[int(np.random.randint(len(options)))]
+        idx = int(np.random.randint(len(options))) if rng is None else int(rng.integers(len(options)))
+        return options[idx]
 
 
 class CircumnavPolicy(MissionPolicy):
