@@ -1,242 +1,82 @@
-# dataset generation for the waypoint-based mission planning task
+# dataset generation for the waypoint-based mission planning task (RAGES+ item 6)
+#
+# All rows (converged and failed) are retained so Stage 2 Q training has
+# access to the full candidate population.  Converged rows get a scalar reward
+# derived from fuel_dv; failed rows get reward=0 and NaN metrics.
+import itertools
+import sys
+from multiprocessing import get_context
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
 import numpy as np
 import torch
-import itertools
-from typing import List, Tuple, Dict, Optional
-from pathlib import Path
-import os, sys
-from multiprocessing import get_context
-from contextlib import nullcontext
 from tqdm import tqdm
 
-# Add root to path
-def find_root_path(path:str, word:str):
-    parts = path.split(word, 1)
-    return parts[0] + word if len(parts) > 1 else path 
 root_folder = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(root_folder / "src"))
 
-from optimization import parameters as param
-from dynamics.dynamics_trans import (
-    propagate_oe,
-    true_to_mean_anomaly,
-    modify_koe,
+from parameters import OK_STATUS
+from rages_sampling import (
+    SplitConfig,
+    WaypointPlan,
+    sample_curated_rollout,
+    verify_waypoint_plan,
 )
-from optimization.optimization import NonConvexOCP
-from optimization.scvx import solve_scvx
-from parameters import (
-    ARTMS_SCALE_FACTORS,
-    BEHAVIOR_IDS,
-    DT_SEC,
-    KOZ_DIMS,
-    MissionPolicy,
-    NODES,
-    N_TIME_MAX,
-    POLICY_REGISTRY,
-    TRUE_ANOMALY_GRID_RAD,
-)
-from utils import time_grid_from_orbits, waypoint_times_from_dts
+from rages_scoring import VERIFIER_METRIC_KEYS
 
-_time_grid_from_orbits = time_grid_from_orbits
-_waypoint_times_from_dts = waypoint_times_from_dts
 
-def enumerate_policy_paths(
-    policy: MissionPolicy,
-    start_node: str,
-    max_steps: int,
-) -> List[Tuple[List[int], List[Tuple[float, float]]]]:
+def _generate_one_sample(args: Tuple) -> Dict:
     """
-    Enumerate unique behavior sequences reachable within max_steps.
-    Returns list of (behavior_sequence, dt_ranges).
+    Deterministically sample one scenario+action (via sample_curated_rollout)
+    and verify it through the full CVX+SCP stack.  Always returns a row; failed
+    rows have converged=False and NaN metrics so they are excluded from wyp
+    training weights but kept for Q training.
     """
-    paths = [(start_node, [], [])]  # (node, beh_seq, dt_ranges)
-    for step_index in range(max_steps):
-        new_paths = []
-        for node, beh_seq, dt_ranges in paths:
-            options = policy.get_next_options(node, step_index)
-            if not options:
-                new_paths.append((node, beh_seq, dt_ranges))
-                continue
-            for next_node, beh, dt_range in options:
-                if beh == 0:
-                    new_paths.append((next_node, beh_seq, dt_ranges))
-                else:
-                    if len(beh_seq) + 1 <= max_steps:
-                        new_paths.append((next_node, beh_seq + [beh], dt_ranges + [dt_range]))
-        paths = new_paths
-
-    # unique by behavior sequence
-    uniq = {}
-    for _, beh_seq, dt_ranges in paths:
-        key = tuple(beh_seq)
-        if key and key not in uniq:
-            uniq[key] = (beh_seq, dt_ranges)
-    return list(uniq.values())
-
-# --- 3. THE GENERATOR (The Engine) ---
-
-def _sample_koz_dim() -> np.ndarray:
-    """ return 2D array with shape (1,3) """
-    dim = float(np.random.choice(KOZ_DIMS))
-    return np.array([[dim, dim, dim]], dtype=float)
-
-def _sample_artms_param() -> np.ndarray:
-    nominal = np.asarray(param.artms_scale_range_1e3, dtype=float).copy()
-    scale = float(np.random.choice(ARTMS_SCALE_FACTORS))
-    return nominal * scale
-
-def _sample_oec0() -> np.ndarray:
-    oec0 = np.asarray(param.oec0, dtype=float).copy()
-    nu = float(np.random.choice(TRUE_ANOMALY_GRID_RAD))
-    oec0[5] = true_to_mean_anomaly(nu, oec0[1])
-    return oec0
-
-def _compute_reward(prob: NonConvexOCP, roe, actions) -> float:
-    # Waypoint selection minimizes DV cost (= SCP objective).
-    dv_total = float(np.linalg.norm(actions, axis=1).sum())
-    return -dv_total
-
-def _generate_one_sample(_: int) -> Optional[Dict[str, object]]:
-    # 1. Pick Campaign
-    camp_type = np.random.choice(list(POLICY_REGISTRY.keys()))
-    policy = POLICY_REGISTRY[camp_type]
-
-    # 2. Initialize
-    start_node = np.random.choice(policy.get_valid_start_nodes())
-    current_state = NODES[start_node].sample()
-    current_node_id = start_node
-
-    # Buffers
-    states = [current_state]  # x0
-    behaviors = []            # b1, b2...
-    dts_orbit = []            # dt1, dt2...
-
-    # 3. Walk the Policy
-    step = 0
-    while True:
-        res = policy.get_next_step(current_node_id, step)
-        if res is None:
-            break
-
-        next_node, beh, (t_min, t_max) = res
-
-        # Handle "Dummy" ops (Logic for "If already there, do nothing")
-        if beh == 0:
-            step += 1
-            continue
-
-        # Generate Data
-        # For station-keeping (behavior_id == 1), keep the state unchanged
-        if beh == 1:
-            next_state = current_state.copy()
-        else:
-            next_state = NODES[next_node].sample()
-        dt_orbit = float(np.random.choice(np.linspace(t_min, t_max, 3)))
-
-        states.append(next_state)
-        behaviors.append(beh)
-        dts_orbit.append(dt_orbit)
-        
-        current_node_id = next_node
-        current_state = next_state
-        step += 1
-
-    # Problem-specific parameters
-    koz_dim = _sample_koz_dim()
-    artms_scale_range_1e3 = _sample_artms_param()
-    oec0 = _sample_oec0()
-    oec0_modified = modify_koe(oec0)
-    n_time, tvec_sec = time_grid_from_orbits(
-        float(np.sum(dts_orbit)),
-        DT_SEC,
-        N_TIME_MAX,
-        oec0[0],
+    sample_id, seed, split = args
+    rollout = sample_curated_rollout(sample_id, seed=seed, split=split)
+    plan = WaypointPlan(
+        waypoint_states=rollout.waypoint_states,
+        dt_fractions=rollout.dt_fractions,
+    )
+    result = verify_waypoint_plan(
+        rollout.scenario,
+        rollout.curated_action.action,
+        plan,
+        candidate_id=0,
     )
 
-    # Build OCP for cost/constraint evaluation
-    if len(states) < 2:
-        return None
-    x0 = states[0]
-    xf = states[-1]
-    waypoints = states[1:-1]
-    t_idx_wyp = waypoint_times_from_dts(dts_orbit, n_time)
-    # convert orbit-based durations to integer timestep durations
-    times = [0] + t_idx_wyp + [n_time - 1]
-    dt_steps = np.diff(times).astype(int)
-    tof_steps = int(n_time - 1)
-    if tof_steps <= 0:
-        return None
-    dt_frac = dt_steps.astype(np.float32) / float(tof_steps)
+    converged = result.status_scp in OK_STATUS
+    metrics_vec = [float(result.metrics.get(k, float("nan"))) for k in VERIFIER_METRIC_KEYS]
+    # Scalar reward for wyp reward-weighted MLE; NaN signals "do not train on this row"
+    reward = -result.metrics["fuel_dv"] if converged else float("nan")
 
-    current_obs = {
-        "state": x0,
-        "goal": xf,
-        "ttg": tvec_sec[-1],
-        "dt": DT_SEC,
-        "oe": oec0,
+    return {
+        # scenario
+        "x0": np.asarray(rollout.scenario.x0, dtype=np.float32),
+        "tof": int(rollout.curated_action.action.tof_steps),
+        "oec0_modified": np.asarray(rollout.scenario.oec0_modified, dtype=np.float32),
+        "koz_dim": np.asarray(rollout.scenario.koz_dim, dtype=np.float32).reshape(-1),
+        "artms_scale_range_1e3": np.asarray(
+            rollout.scenario.artms_scale_range_1e3, dtype=np.float32
+        ),
+        # action
+        "b_seq": list(rollout.curated_action.action.b_seq),
+        # waypoint plan
+        "x_seq": [np.asarray(x, dtype=np.float32) for x in rollout.waypoint_states],
+        "dt_seq": np.asarray(rollout.dt_fractions, dtype=np.float32),
+        # verifier
+        "converged": bool(converged),
+        "status_cvx": result.status_cvx,
+        "status_scp": result.status_scp,
+        "metrics": metrics_vec,   # (4,) in VERIFIER_METRIC_KEYS order; NaN if not converged
+        "reward": float(reward),  # -fuel_dv for converged; NaN for failed
+        # metadata
+        "campaign": rollout.curated_action.curation.policy,
+        "split": rollout.scenario.split,
+        "sample_id": int(sample_id),
     }
-    prob = NonConvexOCP(
-        prob_definition={
-            "t_i": 0,
-            "t_f": n_time,
-            "tvec_sec": tvec_sec,
-            "chance": True,
-            "ct": False,
-            "current_obs": current_obs,
-            "waypoint_times": t_idx_wyp,
-            "waypoints": waypoints,
-            "koz_dim": koz_dim,
-            "artms_scale_range_1e3": artms_scale_range_1e3,
-        }
-    )
-    sol_cvx = prob.ocp_cvx()
-    if sol_cvx["status"] not in ["optimal", "optimal_inaccurate"]:
-        return None
 
-    roe_cvx = sol_cvx["z"]["state"]
-    actions_cvx = sol_cvx["z"]["action"]
-    oec = propagate_oe(oec0, tvec_sec)
-    rtn_cvx = prob.f_2rtn(roe_cvx, oec)
-
-    # solve SCP 
-    prob.zref = {'state': roe_cvx, 'action': actions_cvx}
-    prob.sol_0 = {"z": prob.zref}
-    prob.generate_scaling(roe_cvx, actions_cvx)
-    sol_scp, log_scp = solve_scvx(prob)
-    feas_scp = sol_scp['status']
-    # print(f"campaign type: {camp_type}, SCP Solution Status: {feas_scp}")
-
-    if feas_scp not in ['optimal', 'optimal_inaccurate']:
-        converged = False
-        reward = -1.0
-        rtn_scp = None
-    else:
-        converged = True
-        roe_scp = sol_scp["z"]["state"]
-        actions_scp = sol_scp["z"]["action"]
-        rtn_scp = prob.f_2rtn(roe_scp, oec)
-        reward = _compute_reward(prob, roe_scp, actions_scp)
-
-    # 4. Pack Row
-    row = {
-        # input (X)
-        "x0": x0,
-        "tof": tof_steps,
-        "oec0_modified": oec0_modified,
-        "koz_dim": koz_dim[0],
-        "artms_scale_range_1e3": artms_scale_range_1e3,
-        "b_seq": behaviors,
-        # output (y)
-        "x_seq": states[1:],
-        "dt_seq": dt_frac,
-        # reward
-        "reward": reward,
-        "converged": converged,
-        # other info
-        "campaign": camp_type,
-        "rtn_cvx": rtn_cvx,
-        "rtn_scp": rtn_scp,
-    }
-    return row
 
 def _masked_mean_std(x: torch.Tensor, mask: Optional[torch.Tensor] = None):
     if mask is None:
@@ -250,98 +90,100 @@ def _masked_mean_std(x: torch.Tensor, mask: Optional[torch.Tensor] = None):
     return mean, std
 
 
-def generate_dataset(num_samples=10, num_workers: Optional[int] = 1, max_phase: int = 3):
+def generate_dataset(
+    num_samples: int = 10,
+    num_workers: int = 1,
+    max_phase: int = 3,
+    seed: int = 42,
+    split_config: Optional[SplitConfig] = None,
+) -> Dict:
     """
-    Generate a fixed-size dataset using pre-allocated tensors.
-    Saves rows "as is" and computes mean/std for input/output variables.
+    Generate a fixed-size dataset.
+
+    Every row is stored (converged and failed).  Failed rows have
+    ``converged=0``, ``reward=0``, and NaN metric entries so they receive zero
+    weight in wyp reward-weighted MLE but are available for Q-head training.
     """
-    # Grab one valid sample to infer shapes
-    first_row = None
-    while first_row is None:
-        first_row = _generate_one_sample(0)
+    split_config = split_config or SplitConfig()
+
+    # ---- infer shapes from a single sample ----
+    first_args = (0, seed, split_config.split_for_index(0, num_samples))
+    first_row = _generate_one_sample(first_args)
 
     oe_dim = int(np.atleast_1d(first_row["oec0_modified"]).shape[-1])
-    koz_dim = int(np.atleast_1d(first_row["koz_dim"]).shape[-1])
-    artms_dim = int(np.atleast_1d(first_row["artms_scale_range_1e3"]).shape[-1])
+    koz_d = int(np.atleast_1d(first_row["koz_dim"]).shape[-1])
+    artms_d = int(np.atleast_1d(first_row["artms_scale_range_1e3"]).shape[-1])
+    n_metrics = len(VERIFIER_METRIC_KEYS)
 
-    # Pre-allocate tensors
-    data = {
-        # input (X)
-        "x0": torch.zeros((num_samples, 6), dtype=torch.float32),
-        "tof": torch.zeros((num_samples, 1), dtype=torch.float32),
-        "b_seq": torch.zeros((num_samples, max_phase), dtype=torch.float32),
-        "phase_valid": torch.zeros((num_samples, max_phase), dtype=torch.float32),
-        "oec0_modified": torch.zeros((num_samples, oe_dim), dtype=torch.float32),
-        "koz_dim": torch.zeros((num_samples, koz_dim), dtype=torch.float32),
-        "artms_scale_range_1e3": torch.zeros((num_samples, artms_dim), dtype=torch.float32),
-        # reward (for analysis)
-        "reward": torch.zeros((num_samples,), dtype=torch.float32),
-        "converged": torch.zeros((num_samples,), dtype=torch.float32),
-        # output (y)
-        "x_seq": torch.zeros((num_samples, max_phase, 6), dtype=torch.float32),
-        "dt_seq": torch.zeros((num_samples, max_phase), dtype=torch.float32),
+    # ---- pre-allocate tensors ----
+    data: Dict[str, torch.Tensor] = {
+        "x0":                   torch.zeros((num_samples, 6),            dtype=torch.float32),
+        "tof":                  torch.zeros((num_samples, 1),            dtype=torch.float32),
+        "b_seq":                torch.zeros((num_samples, max_phase),    dtype=torch.float32),
+        "phase_valid":          torch.zeros((num_samples, max_phase),    dtype=torch.float32),
+        "oec0_modified":        torch.zeros((num_samples, oe_dim),       dtype=torch.float32),
+        "koz_dim":              torch.zeros((num_samples, koz_d),        dtype=torch.float32),
+        "artms_scale_range_1e3":torch.zeros((num_samples, artms_d),      dtype=torch.float32),
+        "x_seq":                torch.zeros((num_samples, max_phase, 6), dtype=torch.float32),
+        "dt_seq":               torch.zeros((num_samples, max_phase),    dtype=torch.float32),
+        "converged":            torch.zeros((num_samples,),              dtype=torch.float32),
+        "reward":               torch.zeros((num_samples,),              dtype=torch.float32),
+        "metrics":              torch.full((num_samples, n_metrics), float("nan"), dtype=torch.float32),
     }
 
-    def _fill_from_row(row, idx):
-        x0 = torch.as_tensor(row["x0"], dtype=torch.float32)
-        b_seq = row["b_seq"]
+    def _fill_from_row(row: Dict, idx: int) -> None:
+        b_seq  = row["b_seq"]
         dt_seq = row["dt_seq"]
-        tof = float(row["tof"])
-        x_seq = row["x_seq"]
-        reward = float(row["reward"])
-        converged = float(bool(row["converged"]))
+        x_seq  = row["x_seq"]
         if len(b_seq) != len(dt_seq) or len(b_seq) != len(x_seq):
-            raise ValueError("b_seq, dt_seq, and x_seq must have the same length.")
+            raise ValueError("b_seq, dt_seq, x_seq length mismatch.")
         n_phase = len(b_seq)
         if n_phase > max_phase:
-            raise ValueError(f"Sequence length {n_phase} exceeds max_phase={max_phase}.")
+            raise ValueError(f"Sequence length {n_phase} > max_phase={max_phase}.")
 
-        b_pad = torch.zeros(max_phase, dtype=torch.float32)
+        b_pad  = torch.zeros(max_phase, dtype=torch.float32)
         dt_pad = torch.zeros(max_phase, dtype=torch.float32)
-        x_pad = torch.zeros((max_phase, 6), dtype=torch.float32)
-        b_pad[:n_phase] = torch.as_tensor(b_seq, dtype=torch.float32)
-        dt_pad[:n_phase] = torch.as_tensor(dt_seq, dtype=torch.float32)
-        x_pad[:n_phase] = torch.as_tensor(np.asarray(x_seq, dtype=np.float32), dtype=torch.float32)
-
-        phase_valid = torch.zeros(max_phase, dtype=torch.float32)
+        x_pad  = torch.zeros((max_phase, 6), dtype=torch.float32)
+        b_pad[:n_phase]    = torch.as_tensor(b_seq, dtype=torch.float32)
+        dt_pad[:n_phase]   = torch.as_tensor(dt_seq, dtype=torch.float32)
+        x_pad[:n_phase]    = torch.as_tensor(np.stack(x_seq), dtype=torch.float32)
+        phase_valid        = torch.zeros(max_phase, dtype=torch.float32)
         phase_valid[:n_phase] = 1.0
 
-        oec0_mod = row["oec0_modified"] if "oec0_modified" in row else row["oec0"]
-        oec0_mod = torch.as_tensor(np.asarray(oec0_mod, dtype=np.float32), dtype=torch.float32)
+        data["x0"][idx]                    = torch.as_tensor(row["x0"],                    dtype=torch.float32)
+        data["tof"][idx]                   = torch.tensor([float(row["tof"])],              dtype=torch.float32)
+        data["b_seq"][idx]                 = b_pad
+        data["dt_seq"][idx]                = dt_pad
+        data["x_seq"][idx]                 = x_pad
+        data["phase_valid"][idx]           = phase_valid
+        data["oec0_modified"][idx]         = torch.as_tensor(row["oec0_modified"],          dtype=torch.float32)
+        data["koz_dim"][idx]               = torch.as_tensor(row["koz_dim"],                dtype=torch.float32)
+        data["artms_scale_range_1e3"][idx] = torch.as_tensor(row["artms_scale_range_1e3"], dtype=torch.float32)
+        data["converged"][idx]             = float(row["converged"])
+        # reward: NaN → 0 here; shift applied later only for converged rows
+        r = row["reward"]
+        data["reward"][idx]                = float(r) if np.isfinite(r) else 0.0
+        m = row["metrics"]
+        data["metrics"][idx]               = torch.tensor(m, dtype=torch.float32)
 
-        koz = torch.as_tensor(np.asarray(row["koz_dim"], dtype=np.float32), dtype=torch.float32)
-        artms = torch.as_tensor(
-            np.asarray(row["artms_scale_range_1e3"], dtype=np.float32), dtype=torch.float32
-        )
+    # ---- collect rows ----
+    def _args_iter():
+        for i in itertools.count():
+            yield (i, seed, split_config.split_for_index(i % num_samples, num_samples))
 
-        data["x0"][idx] = x0
-        data["tof"][idx] = torch.tensor([tof], dtype=torch.float32)
-        data["b_seq"][idx] = b_pad
-        data["dt_seq"][idx] = dt_pad
-        data["x_seq"][idx] = x_pad
-        data["phase_valid"][idx] = phase_valid
-        data["oec0_modified"][idx] = oec0_mod
-        data["koz_dim"][idx] = koz
-        data["artms_scale_range_1e3"][idx] = artms
-        data["reward"][idx] = reward
-        data["converged"][idx] = converged
-
-    # Fill first sample
     filled = 0
     _fill_from_row(first_row, filled)
     filled += 1
 
-    # Fill remaining samples
     pbar = tqdm(total=num_samples)
     pbar.update(1)
+
     if num_workers > 1:
         ctx = get_context("spawn")
         pool = ctx.Pool(processes=num_workers)
         try:
-            iterator = pool.imap_unordered(_generate_one_sample, itertools.count())
-            for row in iterator:
-                if row is None:
-                    continue
+            it = pool.imap_unordered(_generate_one_sample, _args_iter())
+            for row in it:
                 _fill_from_row(row, filled)
                 filled += 1
                 pbar.update(1)
@@ -351,70 +193,73 @@ def generate_dataset(num_samples=10, num_workers: Optional[int] = 1, max_phase: 
         finally:
             pool.join()
     else:
+        gen = _args_iter()
+        next(gen)           # skip sample_id=0 already filled
         while filled < num_samples:
-            row = _generate_one_sample(filled)
-            if row is None:
-                continue
+            row = _generate_one_sample(next(gen))
             _fill_from_row(row, filled)
             filled += 1
             pbar.update(1)
+
     pbar.close()
 
-    # shift total reward so all values are positive
-    min_reward = float(data["reward"].min().item())
+    # ---- reward shift (converged rows only; failed rows keep weight=0) ----
+    converged_mask = data["converged"] > 0.5
     reward_shift = 0.0
-    if min_reward < 0.0:
-        reward_shift = -min_reward + 1e-3
-        data["reward"] = data["reward"] + reward_shift
+    if converged_mask.any():
+        min_r = float(data["reward"][converged_mask].min().item())
+        if min_r < 0.0:
+            reward_shift = -min_r + 1e-3
+            data["reward"][converged_mask] = data["reward"][converged_mask] + reward_shift
 
-    # Compute stats (masked for variable-length sequences)
+    n_conv = int(converged_mask.sum().item())
+    print(f"Converged: {n_conv}/{num_samples} ({100*n_conv/num_samples:.1f}%)")
+
+    # ---- stats (all rows for X; converged-only for metrics) ----
     phase_valid = data["phase_valid"]
-    stats = {
-        "x0": {}, "tof": {}, "oec0_modified": {}, "koz_dim": {}, "artms_scale_range_1e3": {}, "b_seq": {},
-        "x_seq": {},
-    }
-
-    # input (X)
-    stats["x0"]["mean"], stats["x0"]["std"] = _masked_mean_std(data["x0"])
-    stats["tof"]["mean"], stats["tof"]["std"] = _masked_mean_std(data["tof"])
-    stats["oec0_modified"]["mean"], stats["oec0_modified"]["std"] = _masked_mean_std(data["oec0_modified"])
-    stats["koz_dim"]["mean"], stats["koz_dim"]["std"] = _masked_mean_std(data["koz_dim"])
+    stats: Dict = {k: {} for k in [
+        "x0", "tof", "oec0_modified", "koz_dim", "artms_scale_range_1e3", "b_seq", "x_seq",
+    ]}
+    stats["x0"]["mean"],             stats["x0"]["std"]             = _masked_mean_std(data["x0"])
+    stats["tof"]["mean"],            stats["tof"]["std"]            = _masked_mean_std(data["tof"])
+    stats["oec0_modified"]["mean"],  stats["oec0_modified"]["std"]  = _masked_mean_std(data["oec0_modified"])
+    stats["koz_dim"]["mean"],        stats["koz_dim"]["std"]        = _masked_mean_std(data["koz_dim"])
     stats["artms_scale_range_1e3"]["mean"], stats["artms_scale_range_1e3"]["std"] = _masked_mean_std(
         data["artms_scale_range_1e3"]
     )
-    stats["b_seq"]["mean"], stats["b_seq"]["std"] = _masked_mean_std(
-        data["b_seq"], mask=phase_valid
-    )
-    # output (y)
-    stats["x_seq"]["mean"], stats["x_seq"]["std"] = _masked_mean_std(
+    stats["b_seq"]["mean"],  stats["b_seq"]["std"]  = _masked_mean_std(data["b_seq"], mask=phase_valid)
+    stats["x_seq"]["mean"],  stats["x_seq"]["std"]  = _masked_mean_std(
         data["x_seq"], mask=phase_valid.unsqueeze(-1)
     )
-    # dt_seq stores fractions that sum to 1; no stats needed
-    
-    dataset = {
+
+    return {
         "data": data,
         "stats": stats,
         "meta": {
-            "num_samples": num_samples,
-            "max_phase": max_phase,
-            "oe_dim": oe_dim,
-            "koz_dim": koz_dim,
-            "artms_dim": artms_dim,
-            "dt_sec": float(DT_SEC),
-            "n_time_max": int(N_TIME_MAX),
-            "reward_shift": reward_shift,
+            "num_samples":    num_samples,
+            "max_phase":      max_phase,
+            "oe_dim":         oe_dim,
+            "koz_dim":        koz_d,
+            "artms_dim":      artms_d,
+            "n_metrics":      n_metrics,
+            "metric_keys":    list(VERIFIER_METRIC_KEYS),
+            "reward_shift":   reward_shift,
+            "seed":           seed,
         },
     }
-    return dataset
+
 
 if __name__ == "__main__":
-    
-    N_data = 80_000
-    N_proc = 20
-    
-    dataset = generate_dataset(N_data, num_workers=N_proc, max_phase=3)
-    
-    # save to file 
-    save_path = root_folder / "rpod" / "rages" / "wyp_data" / "test.pth"
+    N_data    = 80_000
+    N_proc    = 20
+    SEED      = 42
+
+    dataset = generate_dataset(N_data, num_workers=N_proc, max_phase=3, seed=SEED)
+
+    save_path = root_folder / "data" / "wyp_data" / "data_v5.pth"
+    save_path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(dataset, save_path)
-    print(f"Dataset with {dataset['meta']['num_samples']} samples saved to {save_path}")
+    print(f"Dataset saved to {save_path}")
+    meta = dataset["meta"]
+    n_conv = int((dataset["data"]["converged"] > 0.5).sum().item())
+    print(f"  samples: {meta['num_samples']}  converged: {n_conv}  metric_keys: {meta['metric_keys']}")
