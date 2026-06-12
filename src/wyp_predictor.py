@@ -15,7 +15,8 @@ Model classes share an informal protocol used by training and inference:
     sample_y(x_in, y_in, m_known, cfg, phase_valid, ...) -> y (scaled)
 
 followed by `constrained_fill` to combine known values and enforce the dt
-simplex. The future flow-matching model should implement the same protocol.
+simplex. `ConditionalGMM`, `ConditionalVAE`, and `ConditionalFlowMatcher`
+implement this protocol.
 """
 
 from dataclasses import MISSING, dataclass
@@ -42,6 +43,7 @@ class FillerConfig:
     kl_beta: float = 1e-3               # VAE KL weight
     b_seq_encoding: str = "one_hot"      # "scalar" or "one_hot"
     b_seq_num_classes: int = 11         # used when b_seq_encoding == "one_hot"
+    flow_steps: int = 32                # Euler steps for the flow-matching ODE decode
 
 def _encode_b_seq(
     b_seq: torch.Tensor,
@@ -507,6 +509,114 @@ class ConditionalVAE(nn.Module):
         return torch.cat([w_sample, dt_logits], dim=-1)
 
 
+class ConditionalFlowMatcher(nn.Module):
+    """
+    Conditional flow matching for masked waypoint filling.
+
+    A velocity network v_theta(y_t, t, cond) regresses the straight-line
+    conditional velocity (y_1 - y_0) between a standard-normal base sample
+    y_0 and the supervised plan y_1, where y_1 carries scaled waypoint states
+    and dt logits (log fractions). Sampling integrates the learned ODE from
+    the base sample with fixed Euler steps (`cfg.flow_steps`).
+
+    `use_mean_w=True` integrates from the zero base sample, giving the
+    deterministic ODE decode used for Q-label generation. The output follows
+    the GMM/VAE `sample_y` convention: scaled waypoint values plus dt logits,
+    finalized by `constrained_fill`.
+    """
+    def __init__(self, cfg: FillerConfig):
+        super().__init__()
+        self.cfg = cfg
+        self.w_dim = cfg.max_phase * 6
+        self.dt_dim = cfg.max_phase
+        self.y_dim = self.w_dim + self.dt_dim
+
+        cond_dim = cfg.input_dim
+        cond_dim += self.y_dim   # y values (with zeros for missing)
+        cond_dim += self.y_dim   # y mask
+        in_dim = cond_dim + self.y_dim + 1  # + flow state y_t and scalar time t
+
+        layers = []
+        d = in_dim
+        for _ in range(cfg.n_hidden_layers):
+            layers += [nn.Linear(d, cfg.hidden_dim), nn.GELU()]
+            if cfg.dropout > 0:
+                layers += [nn.Dropout(cfg.dropout)]
+            d = cfg.hidden_dim
+        self.backbone = nn.Sequential(*layers)
+        self.head_velocity = nn.Linear(cfg.hidden_dim, self.y_dim)
+
+        nn.init.zeros_(self.head_velocity.bias)
+
+    def velocity(self, y_t: torch.Tensor, t: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
+        h = self.backbone(torch.cat([cond, y_t, t], dim=-1))
+        return self.head_velocity(h)
+
+    def forward(self, x_in, y=None, m=None):
+        # Conditioning only; the flow-matching regression happens in
+        # compute_loss, which needs the supervised target y_1.
+        return {"cond": build_cond_input(x_in, y, m, self.cfg)}
+
+    def _flow_target(self, y_true, phase_valid=None):
+        # Map the supervised plan to flow space: scaled waypoints as-is, dt
+        # fractions as log logits (masked softmax in constrained_fill recovers
+        # the simplex). Padded dt slots are zeroed to keep y_t in range.
+        dt_true = y_true[:, self.w_dim:]
+        if phase_valid is None:
+            dt_valid = (dt_true > 0.0).to(y_true.dtype)
+        else:
+            dt_valid = phase_valid.to(y_true.dtype)
+        dt_logits = torch.log(dt_true.clamp_min(1e-8)) * dt_valid
+        return torch.cat([y_true[:, : self.w_dim], dt_logits], dim=-1)
+
+    def compute_loss(self, y_true, m_missing, out, weights=None, phase_valid=None):
+        cond = out["cond"]
+        y1 = self._flow_target(y_true, phase_valid=phase_valid)
+
+        B = y1.shape[0]
+        t = torch.rand(B, 1, device=y1.device, dtype=y1.dtype)
+        y0 = torch.randn_like(y1)
+        y_t = (1.0 - t) * y0 + t * y1
+        v_target = y1 - y0
+        v_pred = self.velocity(y_t, t, cond)
+
+        # Supervise only missing valid dims, mirroring masked_mdn_nll
+        sq = (v_pred - v_target) ** 2
+        denom = m_missing.sum(dim=-1).clamp_min(1.0)
+        per_sample = (sq * m_missing).sum(dim=-1) / denom
+
+        if weights is None:
+            return per_sample.mean()
+        w = weights.view(-1)
+        w = w / w.sum().clamp_min(1e-8)
+        return (per_sample * w).sum()
+
+    @torch.no_grad()
+    def sample_y(
+        self,
+        x_in: torch.Tensor,
+        y_in: torch.Tensor,
+        m_known: torch.Tensor,
+        cfg: FillerConfig,
+        phase_valid: Optional[torch.Tensor] = None,
+        dt_mode: str = "dirichlet_sample",
+        use_mean_w: bool = False,
+    ) -> torch.Tensor:
+        cond = build_cond_input(x_in, y_in, m_known, cfg)
+        B = x_in.shape[0]
+        if use_mean_w:
+            y = torch.zeros(B, self.y_dim, device=x_in.device, dtype=x_in.dtype)
+        else:
+            y = torch.randn(B, self.y_dim, device=x_in.device, dtype=x_in.dtype)
+
+        n_steps = int(getattr(cfg, "flow_steps", 32))
+        dt = 1.0 / n_steps
+        for k in range(n_steps):
+            t = torch.full((B, 1), k * dt, device=x_in.device, dtype=x_in.dtype)
+            y = y + self.velocity(y, t, cond) * dt
+        return y
+
+
 def masked_mdn_nll(pi, mu, std, y_true, mask_missing, weights=None, eps: float = 1e-8):
     """
     Masked negative log-likelihood for a diagonal Gaussian mixture (MDN).
@@ -706,7 +816,12 @@ def load_model(ckpt_path: Path):
     cfg = FillerConfig(**filtered)
 
     model_type = ckpt.get("model_type", "gmm")
-    model = ConditionalVAE(cfg) if model_type == "vae" else ConditionalGMM(cfg)
+    if model_type == "vae":
+        model = ConditionalVAE(cfg)
+    elif model_type == "flow":
+        model = ConditionalFlowMatcher(cfg)
+    else:
+        model = ConditionalGMM(cfg)
     model.load_state_dict(ckpt["model_state_dict"])
     model.to(device)
     model.eval()
