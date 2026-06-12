@@ -137,6 +137,7 @@ class NodeVolume:
     name: str
     d_lambda_range: Range
     d_ex_range: MultiRange
+    d_i_range: Optional[MultiRange] = None
 
     def _sample_range(
         self,
@@ -154,22 +155,31 @@ class NodeVolume:
             return float(np.random.choice(grid))
         return float(grid[int(rng.integers(len(grid)))])
 
+    @property
+    def d_iy_range(self) -> MultiRange:
+        return self.d_i_range if self.d_i_range is not None else self.d_ex_range
+
     def sample(self, rng: Optional[np.random.Generator] = None) -> np.ndarray:
         da = 0.0
         dl = self._sample_range(self.d_lambda_range, rng=rng)
         dex = 0.0
         dey = self._sample_range(self.d_ex_range, rng=rng)
         dix = 0.0
-        diy = dey
+        diy = self._sample_range(self.d_iy_range, rng=rng)
         return np.array([da, dl, dex, dey, dix, diy])
 
 
+# Keep EI-separated samples away from the flat near-zero band while allowing
+# independent E/I signs: (+,+), (+,-), (-,+), and (-,-).
+EI_SEPARATION_RANGES = ((30.0, 70.0), (-70.0, -30.0))
+FLAT_EI_RANGE = (-5.0, 5.0)
+
 NODES = {
-    N_CENTER: NodeVolume(N_CENTER, (-5, 5), [(30, 70)]),
-    N_POS_EI: NodeVolume(N_POS_EI, (100, 250), [(30, 70)]),
-    N_POS_FLAT: NodeVolume(N_POS_FLAT, (100, 250), (-5, 5)),
-    N_NEG_EI: NodeVolume(N_NEG_EI, (-250, -100), [(30, 70)]),
-    N_NEG_FLAT: NodeVolume(N_NEG_FLAT, (-250, -100), (-5, 5)),
+    N_CENTER: NodeVolume(N_CENTER, (-5, 5), EI_SEPARATION_RANGES, EI_SEPARATION_RANGES),
+    N_POS_EI: NodeVolume(N_POS_EI, (100, 250), EI_SEPARATION_RANGES, EI_SEPARATION_RANGES),
+    N_POS_FLAT: NodeVolume(N_POS_FLAT, (100, 250), FLAT_EI_RANGE, FLAT_EI_RANGE),
+    N_NEG_EI: NodeVolume(N_NEG_EI, (-250, -100), EI_SEPARATION_RANGES, EI_SEPARATION_RANGES),
+    N_NEG_FLAT: NodeVolume(N_NEG_FLAT, (-250, -100), FLAT_EI_RANGE, FLAT_EI_RANGE),
 }
 
 

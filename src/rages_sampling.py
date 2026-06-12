@@ -531,6 +531,182 @@ def sample_curated_rollout(
     )
 
 
+def sample_scenario(
+    sample_id: int,
+    *,
+    seed: int,
+    split: str = "unspecified",
+) -> ScenarioSample:
+    """
+    Deterministically sample only the physical scenario state.
+
+    Stage 2 Q data needs many candidate actions for the same scenario, so this
+    helper keeps scenario generation separate from curation-action generation.
+    """
+
+    rng = _rng_for_index(seed=int(seed), index=int(sample_id))
+    valid_starts = sorted(
+        {
+            str(node)
+            for policy in POLICY_REGISTRY.values()
+            for node in policy.get_valid_start_nodes()
+        }
+    )
+    start_domain = str(valid_starts[int(rng.integers(len(valid_starts)))])
+    return ScenarioSample(
+        sample_id=int(sample_id),
+        split=str(split),
+        x0=np.asarray(NODES[start_domain].sample(rng=rng), dtype=float),
+        oec0_modified=_sample_oec0_modified(rng),
+        koz_dim=_sample_koz_dim(rng),
+        artms_scale_range_1e3=_sample_artms_param(rng),
+        start_domain=start_domain,
+    )
+
+
+def enumerate_policy_paths(
+    policy: Any,
+    start_node: str,
+    *,
+    max_phase: int = 3,
+    max_policy_steps: Optional[int] = None,
+) -> List[Tuple[Tuple[int, ...], Tuple[Range, ...], Tuple[str, ...]]]:
+    """
+    Enumerate graph-valid behavior paths from one start node.
+
+    Returns `(b_seq, dt_ranges, target_domains)` tuples. Behavior id 0 is a
+    graph-only transition and is not included in the action sequence.
+    """
+
+    max_policy_steps = int(max_policy_steps or max(8, int(max_phase) + 6))
+    out: List[Tuple[Tuple[int, ...], Tuple[Range, ...], Tuple[str, ...]]] = []
+    seen = set()
+
+    def _add(
+        behaviors: Tuple[int, ...],
+        dt_ranges: Tuple[Range, ...],
+        target_domains: Tuple[str, ...],
+    ) -> None:
+        if not behaviors:
+            return
+        key = (behaviors, dt_ranges, target_domains)
+        if key in seen:
+            return
+        seen.add(key)
+        out.append(key)
+
+    def _walk(
+        current_node: str,
+        step_index: int,
+        behaviors: Tuple[int, ...],
+        dt_ranges: Tuple[Range, ...],
+        target_domains: Tuple[str, ...],
+    ) -> None:
+        _add(behaviors, dt_ranges, target_domains)
+        if len(behaviors) >= int(max_phase) or step_index >= max_policy_steps:
+            return
+
+        options = policy.get_next_options(current_node, step_index)
+        if not options:
+            return
+
+        for next_node, behavior_id, dt_range in options:
+            next_node = str(next_node)
+            behavior_id = int(behavior_id)
+            dt_range = (float(dt_range[0]), float(dt_range[1]))
+            if behavior_id == 0:
+                _walk(next_node, step_index + 1, behaviors, dt_ranges, target_domains)
+                continue
+            _walk(
+                next_node,
+                step_index + 1,
+                behaviors + (behavior_id,),
+                dt_ranges + (dt_range,),
+                target_domains + (next_node,),
+            )
+
+    _walk(str(start_node), 0, (), (), ())
+    return out
+
+
+def sample_candidate_actions(
+    scenario: ScenarioSample,
+    *,
+    n_candidates: int,
+    seed: int,
+    max_phase: int = 3,
+) -> List[CuratedAction]:
+    """
+    Sample graph-valid candidate actions for one fixed scenario.
+
+    This is intentionally stochastic-but-seeded and V0-simple: sample a valid
+    policy path, sample each phase duration inside its curation range, and
+    convert the total duration to `tof_steps`.
+    """
+
+    all_paths: List[Tuple[str, Tuple[int, ...], Tuple[Range, ...], Tuple[str, ...]]] = []
+    for policy_name in sorted(POLICY_REGISTRY.keys()):
+        policy = POLICY_REGISTRY[policy_name]
+        if scenario.start_domain not in policy.get_valid_start_nodes():
+            continue
+        for b_seq, dt_ranges, target_domains in enumerate_policy_paths(
+            policy,
+            scenario.start_domain,
+            max_phase=max_phase,
+        ):
+            all_paths.append((policy_name, b_seq, dt_ranges, target_domains))
+    if not all_paths:
+        raise RuntimeError(
+            f"No graph-valid candidate actions for start_domain={scenario.start_domain}."
+        )
+
+    rng = _rng_for_index(seed=int(seed) + 17, index=int(scenario.sample_id))
+    oec0 = np.asarray(opt_param.oec0, dtype=float).copy()
+    actions: List[CuratedAction] = []
+    seen = set()
+    max_attempts = max(100, int(n_candidates) * 20)
+
+    for _ in range(max_attempts):
+        policy_name, b_seq, dt_ranges, target_domains = all_paths[
+            int(rng.integers(len(all_paths)))
+        ]
+        dt_orbits = tuple(float(rng.uniform(lo, hi)) for lo, hi in dt_ranges)
+        n_time, _ = _time_grid_from_orbits(
+            float(np.sum(dt_orbits)),
+            DT_SEC,
+            N_TIME_MAX,
+            oec0[0],
+        )
+        tof_steps = int(n_time - 1)
+        if tof_steps <= 0:
+            continue
+        key = (b_seq, tof_steps)
+        if key in seen and len(seen) < len(all_paths) * max(1, int(n_candidates)):
+            continue
+        seen.add(key)
+        actions.append(
+            CuratedAction(
+                action=Action.from_values(b_seq=b_seq, tof_steps=tof_steps),
+                curation=ActionCurationMetadata(
+                    policy=policy_name,
+                    dt_orbits=dt_orbits,
+                    dt_ranges=dt_ranges,
+                    target_domains=target_domains,
+                ),
+            )
+        )
+        if len(actions) >= int(n_candidates):
+            return actions
+
+    if actions:
+        while len(actions) < int(n_candidates):
+            actions.append(actions[len(actions) % len(actions)])
+        return actions
+    raise RuntimeError(
+        f"Unable to sample candidate actions for scenario {scenario.sample_id}."
+    )
+
+
 def sample_curated_rollouts(
     n_samples: int,
     *,

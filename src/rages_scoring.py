@@ -130,6 +130,7 @@ class LexicographicPreference:
 
     priority: Tuple[str, ...] = tuple(DEFAULT_INTENT_PRIORITY)
     epsilons: Mapping[str, float] = field(default_factory=lambda: dict(DEFAULT_EPSILONS))
+    p_conv_threshold: float = 0.5
 
     def __post_init__(self) -> None:
         unknown = [p for p in self.priority if p not in INTENT_TO_METRIC]
@@ -137,7 +138,11 @@ class LexicographicPreference:
             raise ValueError(f"Unknown intent name(s) in priority: {unknown}")
         if len(set(self.priority)) != len(self.priority):
             raise ValueError(f"Duplicate intent names in priority: {self.priority}")
+        threshold = float(self.p_conv_threshold)
+        if not 0.0 <= threshold <= 1.0:
+            raise ValueError("p_conv_threshold must be in [0, 1].")
         object.__setattr__(self, "priority", tuple(str(p) for p in self.priority))
+        object.__setattr__(self, "p_conv_threshold", threshold)
 
 
 def lexicographic_key(
@@ -212,6 +217,68 @@ def select_best(
     if not candidates:
         return None
     return min(candidates)[1]
+
+
+def q_p_conv(q_output: Any) -> float:
+    p_conv = getattr(q_output, "p_conv", None)
+    if p_conv is None and isinstance(q_output, Mapping):
+        p_conv = q_output.get("p_conv")
+    return float(p_conv)
+
+
+def q_metric_row(q_output: Any) -> Dict[str, float]:
+    raw_metrics = getattr(q_output, "metric_means", None)
+    if raw_metrics is None and isinstance(q_output, Mapping):
+        raw_metrics = q_output.get("metric_means", q_output.get("metrics", None))
+    if isinstance(raw_metrics, Mapping):
+        return {
+            metric: float(raw_metrics.get(metric, np.nan))
+            for metric in VERIFIER_METRIC_KEYS
+        }
+    vals = np.asarray(raw_metrics if raw_metrics is not None else [], dtype=float).reshape(-1)
+    return {
+        metric: float(vals[i]) if i < len(vals) else float("nan")
+        for i, metric in enumerate(VERIFIER_METRIC_KEYS)
+    }
+
+
+def q_feasible(
+    q_output: Any,
+    preference: Optional[LexicographicPreference] = None,
+    *,
+    threshold: Optional[float] = None,
+) -> bool:
+    if threshold is None:
+        threshold = 0.5 if preference is None else preference.p_conv_threshold
+    return q_p_conv(q_output) >= float(threshold)
+
+
+def q_scoring_inputs(
+    q_outputs: Sequence[Any],
+    preference: Optional[LexicographicPreference] = None,
+    *,
+    threshold: Optional[float] = None,
+) -> Tuple[List[Dict[str, float]], List[bool]]:
+    return (
+        [q_metric_row(q) for q in q_outputs],
+        [q_feasible(q, preference, threshold=threshold) for q in q_outputs],
+    )
+
+
+def rank_q_candidates(
+    q_outputs: Sequence[Any],
+    preference: LexicographicPreference,
+) -> List[int]:
+    metric_rows, feasible = q_scoring_inputs(q_outputs, preference)
+    return rank_candidates(metric_rows, preference, feasible=feasible)
+
+
+def select_best_q(
+    q_outputs: Sequence[Any],
+    preference: LexicographicPreference,
+) -> Optional[int]:
+    metric_rows, feasible = q_scoring_inputs(q_outputs, preference)
+    return select_best(metric_rows, preference, feasible=feasible)
 
 
 def hard_filter_pass_all(

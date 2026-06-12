@@ -78,7 +78,7 @@ def parse_args() -> argparse.Namespace:
         nargs="+",
         default=[0.0, 5.0, 10.0],
         help=(
-            "Waypoint-domain tolerance values applied equally to d_lambda and d_ey. "
+            "Waypoint-domain tolerance values applied equally to d_lambda, d_ey, and d_iy. "
             "Use one or more values to compare shared margins, e.g. 0 5 10."
         ),
     )
@@ -95,7 +95,7 @@ def _parse_error_margin(raw_margin: Sequence[float]) -> np.ndarray:
             )
         if not np.allclose(margin_arr[:, 0], margin_arr[:, 1]):
             raise ValueError(
-                "--error-margin no longer supports different d_lambda/d_ey values. "
+                "--error-margin no longer supports different d_lambda/d_ey/d_iy values. "
                 "Use shared scalar margins only."
             )
         margin = margin_arr[:, 0].reshape(-1)
@@ -137,15 +137,16 @@ def _is_state_in_target_domain(
         return np.zeros(margins.shape[0], dtype=bool)
 
     s = np.asarray(state, dtype=float).reshape(-1)
-    if s.size < 4:
+    if s.size < 6:
         return np.zeros(margins.shape[0], dtype=bool)
 
     dl = float(s[1])
     dey = float(s[3])
-    return _in_range_with_margin(dl, vol.d_lambda_range, margins[:, 0]) & _in_multirange_with_margin(
-        dey,
-        vol.d_ex_range,
-        margins[:, 1],
+    diy = float(s[5])
+    return (
+        _in_range_with_margin(dl, vol.d_lambda_range, margins[:, 0])
+        & _in_multirange_with_margin(dey, vol.d_ex_range, margins[:, 1])
+        & _in_multirange_with_margin(diy, vol.d_iy_range, margins[:, 1])
     )
 
 
@@ -599,7 +600,7 @@ def main() -> None:
         dey_margin = float(error_margin[i, 1])
         print(
             f"[done] traj_domain_ok@margin[{i}] "
-            f"(d_lambda={dl_margin:.6g}, d_ey={dey_margin:.6g}) "
+            f"(d_lambda={dl_margin:.6g}, d_ey/d_iy={dey_margin:.6g}) "
             f"model={int(n_model_domain_ok_by_margin[i])}/{len(rows)} "
             f"rand={int(n_rand_domain_ok_by_margin[i])}/{len(rows)}"
         )

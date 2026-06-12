@@ -112,7 +112,8 @@ def sample_state_from_node(node_name: str, rng: np.random.Generator) -> np.ndarr
     vol = NODES[node_name]
     dl = sample_from_range(vol.d_lambda_range, rng)
     dey = sample_from_range(vol.d_ex_range, rng)
-    return np.array([0.0, dl, 0.0, dey, 0.0, dey], dtype=float)
+    diy = sample_from_range(vol.d_iy_range, rng)
+    return np.array([0.0, dl, 0.0, dey, 0.0, diy], dtype=float)
 
 
 def in_range(x: float, r: Tuple[float, float], tol: float = 0.0) -> bool:
@@ -128,9 +129,14 @@ def in_multirange(x: float, r: Any, tol: float = 0.0) -> bool:
 def classify_orbital_domain(state: np.ndarray, nodes=NODES, tol: float = 1e-6) -> List[str]:
     dl = float(state[1])
     dey = float(state[3])
+    diy = float(state[5])
     matches = []
     for name, vol in nodes.items():
-        if in_range(dl, vol.d_lambda_range, tol=tol) and in_multirange(dey, vol.d_ex_range, tol=tol):
+        if (
+            in_range(dl, vol.d_lambda_range, tol=tol)
+            and in_multirange(dey, vol.d_ex_range, tol=tol)
+            and in_multirange(diy, vol.d_iy_range, tol=tol)
+        ):
             matches.append(name)
     return matches
 
