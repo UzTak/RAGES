@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import sys
 from pathlib import Path
 from typing import Any, Dict
@@ -10,11 +9,16 @@ from typing import Any, Dict
 import numpy as np
 import torch
 
-def find_root_path(path: str, word: str) -> str:
-    parts = path.split(word, 1)
-    return parts[0] + word if len(parts) > 1 else path
-
 ROOT_FOLDER = Path(__file__).resolve().parents[1]
+SRC_FOLDER = ROOT_FOLDER / "src"
+WORK_FOLDER = ROOT_FOLDER / "work"
+for _path in (SRC_FOLDER, WORK_FOLDER):
+    if str(_path) not in sys.path:
+        sys.path.insert(0, str(_path))
+
+DEFAULT_REASONING_ADAPTER_DIR = ROOT_FOLDER / "model/reasoning_model/v2/checkpoint-8400"
+DEFAULT_WYP_CKPT_PATH = ROOT_FOLDER / "model/wyp_model/model_gmm_v3_weighted_one_hot.pt"
+DEFAULT_WYP_DATA_PATH = ROOT_FOLDER / "data/wyp_data/data_v3_discrete.pth"
 
 from datagen_reasoning import (
     generate_traj_with_wyp,
@@ -45,10 +49,10 @@ class RAGES:
 
     def __init__(
         self,
-        adapter_dir: Path = ROOT_FOLDER / "rpod/rages/reasoning_model/v2/checkpoint-8400",
+        adapter_dir: Path = DEFAULT_REASONING_ADAPTER_DIR,
         base_model: str = "Qwen/Qwen2.5-7B-Instruct",
-        wyp_ckpt_path: Path = ROOT_FOLDER / "rpod/rages/wyp_model/model_gmm_v3_weighted_one_hot.pt",
-        data_path: Path = ROOT_FOLDER / "rpod/rages/wyp_data/data_v3_discrete.pth",
+        wyp_ckpt_path: Path = DEFAULT_WYP_CKPT_PATH,
+        data_path: Path = DEFAULT_WYP_DATA_PATH,
     ) -> None:
         self.adapter_dir = Path(adapter_dir)
         self.base_model_name = base_model
