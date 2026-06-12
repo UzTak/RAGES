@@ -5,10 +5,9 @@ import json
 import os, sys
 import re
 import multiprocessing as mp
-from dataclasses import MISSING
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence
 
 import numpy as np
 import torch
@@ -24,10 +23,8 @@ def find_root_path(path: str, word: str) -> str:
 
 ROOT_FOLDER = Path(__file__).resolve().parents[1]
 
-from optimization.optimization import NonConvexOCP
-from optimization.scvx import solve_scvx
+from optimization.optimization import generate_traj_with_wyp
 import optimization.parameters as param
-from dynamics.dynamics_trans import propagate_oe, propagate_ct, restore_koe
 from parameters import (
     DEFAULT_B_SEQ_ENCODING,
     DEFAULT_B_SEQ_NUM_CLASSES,
@@ -39,15 +36,11 @@ from parameters import (
     OK_STATUS,
     POLICY_REGISTRY,
 )
-from train_wyp_predictor import (
-    ConditionalGMM,
-    ConditionalVAE,
-    constrained_fill,
-    scale_var,
-    unscale_var,
-    FillerConfig,
-    build_input_from_data,
+from rages_scoring import compute_metrics
+from wyp_predictor import (
     build_input_slices,
+    load_model,
+    predict_wyp_seq,
 )
 from datagen_wyp import (
     enumerate_policy_paths,
@@ -82,45 +75,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--llm-model", type=str, default="gpt-4o-mini")
 
     return parser.parse_args()
-
-
-def load_model(ckpt_path: Path):
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    # print("device for waypoint inference:", device)
-    ckpt = torch.load(ckpt_path, map_location="cpu")
-    cfg_raw = ckpt["cfg"]
-    cfg_dict = dict(cfg_raw) if isinstance(cfg_raw, dict) else dict(vars(cfg_raw))
-
-    for name, field in FillerConfig.__dataclass_fields__.items():
-        if name not in cfg_dict and field.default is not MISSING:
-            cfg_dict[name] = field.default
-
-    fields = set(FillerConfig.__dataclass_fields__.keys())
-    filtered = {k: v for k, v in cfg_dict.items() if k in fields}
-    cfg = FillerConfig(**filtered)
-
-    model_type = ckpt.get("model_type", "gmm")
-    model = ConditionalVAE(cfg) if model_type == "vae" else ConditionalGMM(cfg)
-    model.load_state_dict(ckpt["model_state_dict"])
-    model.to(device)
-    model.eval()
-
-    def _to_device_if_tensor(x):
-        return x.to(device) if isinstance(x, torch.Tensor) else x
-
-    return {
-        "cfg": cfg,
-        "model": model,
-        "device": device,
-        "y_mean": _to_device_if_tensor(ckpt["y_mean"]),
-        "y_std": _to_device_if_tensor(ckpt["y_std"]),
-        "X_mean": _to_device_if_tensor(ckpt["X_mean"]),
-        "X_std": _to_device_if_tensor(ckpt["X_std"]),
-        "inputs_arg": ckpt.get(
-            "inputs_arg",
-            ["x0", "tof", "oec0_modified", "artms_scale_range_1e3", "koz_dim", "b_seq"],
-        ),
-    }
 
 
 def load_dataset(data_path: Path):
@@ -168,232 +122,6 @@ def generate_behavior_seq(
             }
         )
     return scenarios
-
-
-def build_data_from_values(values: Dict[str, Any], max_phase: int) -> Dict[str, torch.Tensor]:
-    data: Dict[str, torch.Tensor] = {}
-    data["x0"] = torch.as_tensor(values["x0"], dtype=torch.float32).reshape(1, -1)
-    data["tof"] = torch.as_tensor([[values["tof"]]], dtype=torch.float32)
-    data["oec0_modified"] = torch.as_tensor(values["oec0_modified"], dtype=torch.float32).reshape(1, -1)
-    data["artms_scale_range_1e3"] = torch.as_tensor(values["artms_scale_range_1e3"], dtype=torch.float32).reshape(1, -1)
-    data["koz_dim"] = torch.as_tensor(values["koz_dim"], dtype=torch.float32).reshape(1, -1)
-
-    b_pad = np.zeros((1, max_phase), dtype=np.float32)
-    b_seq = np.asarray(values["b_seq"], dtype=np.float32)
-    b_pad[0, : min(len(b_seq), max_phase)] = b_seq[:max_phase]
-    data["b_seq"] = torch.as_tensor(b_pad, dtype=torch.float32)
-
-    x_seq = np.zeros((1, max_phase, 6), dtype=np.float32)
-    data["x_seq"] = torch.as_tensor(x_seq, dtype=torch.float32)
-    return data
-
-
-def predict_wyp_seq(
-    model_bundle: Dict[str, Any],
-    input_slices: Dict[str, slice],
-    x0: np.ndarray,
-    tof_steps: int,
-    b_seq: Sequence[int],
-    oec0_mod: np.ndarray,
-    artms: np.ndarray,
-    koz_dim: np.ndarray,
-    use_mean_w: bool = True,
-) -> Tuple[np.ndarray, np.ndarray]:
-    cfg: FillerConfig = model_bundle["cfg"]
-    model = model_bundle["model"]
-    device: torch.device = model_bundle["device"]
-    y_mean, y_std = model_bundle["y_mean"], model_bundle["y_std"]
-    X_mean, X_std = model_bundle["X_mean"], model_bundle["X_std"]
-    inputs_arg = model_bundle["inputs_arg"]
-
-    max_phase = cfg.max_phase
-    phase_valid = np.zeros(max_phase, dtype=bool)
-    phase_valid[: len(b_seq)] = True
-    phase_valid_t = torch.tensor(phase_valid, dtype=torch.float32, device=device).unsqueeze(0)
-
-    y_dim = max_phase * 6 + max_phase
-    y_in = torch.zeros(1, y_dim, device=device)
-    m_known = torch.zeros(1, y_dim, device=device)
-
-    values = {
-        "x0": x0,
-        "tof": tof_steps,
-        "oec0_modified": oec0_mod,
-        "artms_scale_range_1e3": artms,
-        "koz_dim": koz_dim,
-        "b_seq": b_seq,
-    }
-    data_like = build_data_from_values(values, max_phase)
-    x_full = build_input_from_data(
-        data_like,
-        0,
-        inputs_arg,
-        # Dataset b_seq stays scalar IDs; build_input_from_data handles one-hot expansion.
-        b_seq_encoding=getattr(cfg, "b_seq_encoding", DEFAULT_B_SEQ_ENCODING),
-        b_seq_num_classes=int(getattr(cfg, "b_seq_num_classes", DEFAULT_B_SEQ_NUM_CLASSES)),
-    ).unsqueeze(0).to(device)
-    x_full = scale_var(x_full, X_mean, X_std)
-
-    if "b_seq" in input_slices:
-        b_slice = input_slices["b_seq"]
-        b_width = int(b_slice.stop - b_slice.start)
-        if b_width == int(max_phase):
-            b_phase_valid = phase_valid_t
-        elif b_width % int(max_phase) == 0:
-            rep = b_width // int(max_phase)
-            b_phase_valid = phase_valid_t.repeat_interleave(rep, dim=-1)
-        else:
-            raise ValueError(
-                f"b_seq input width {b_width} is incompatible with max_phase={max_phase}."
-            )
-        x_full[:, b_slice.start : b_slice.stop] = (
-            x_full[:, b_slice.start : b_slice.stop] * b_phase_valid
-        )
-
-    with torch.no_grad():
-        y_scaled = model.sample_y(x_full, y_in, m_known, cfg, phase_valid=phase_valid_t, use_mean_w=use_mean_w)
-        y_unscaled = unscale_var(y_scaled, y_mean, y_std)
-
-    tof_raw_t = torch.tensor([[tof_steps]], dtype=torch.float32, device=device)
-    y_filled = constrained_fill(y_unscaled, y_in, m_known, tof_raw_t, cfg, phase_valid=phase_valid_t)
-    x_pred = y_filled[0, : max_phase * 6].reshape(max_phase, 6).detach().cpu().numpy()
-    dt_pred = y_filled[0, max_phase * 6 :].detach().cpu().numpy()
-    return x_pred[: len(b_seq)], dt_pred[: len(b_seq)]
-
-
-def _restore_oec0_modified(oec0_mod: np.ndarray) -> np.ndarray:
-    oec0 = np.asarray(restore_koe(np.asarray(oec0_mod, dtype=float)), dtype=float).reshape(-1)
-    if oec0.shape != (6,):
-        raise ValueError(f"Restored OE must have shape (6,), got {oec0.shape}")
-    return oec0
-
-
-def generate_traj_with_wyp(
-    x0: np.ndarray,
-    x_pred: np.ndarray,
-    dt_pred: np.ndarray,
-    tof_steps: int,
-    koz_dim: np.ndarray,
-    artms: np.ndarray,
-    dt_sec: float,
-    oec0_mod: np.ndarray | None = None,
-    obj_type: str = "min_fuel",
-) -> Dict[str, Any]:
-    n_time = int(tof_steps) + 1
-    if n_time < 2:
-        return {"status_cvx": "invalid_tof", "status_scp": "invalid_tof"}
-
-    tvec_sec = np.arange(n_time, dtype=float) * dt_sec
-    oec0 = _restore_oec0_modified(oec0_mod) if oec0_mod is not None else np.asarray(param.oec0, dtype=float)
-    t_idx_wyp = waypoint_times_from_dts(list(dt_pred), n_time)
-    wyp = x_pred[:-1] if len(x_pred) > 1 else np.empty((0, 6))
-    goal = x_pred[-1] if len(x_pred) > 0 else x0
-
-    current_obs = {"state": x0, "goal": goal, "ttg": tvec_sec[-1], "dt": dt_sec, "oe": oec0}
-    prob = NonConvexOCP(
-        prob_definition={
-            "t_i": 0,
-            "t_f": n_time,
-            "tvec_sec": tvec_sec,
-            "chance": True,
-            "ct": False,
-            "current_obs": current_obs,
-            "waypoint_times": t_idx_wyp,
-            "waypoints": wyp,
-            "waypoint_type": "roe",
-            "koz_dim": koz_dim,
-            "artms_scale_range_1e3": artms,
-        }
-    )
-
-    sol_dict = {
-        "wyp": x_pred,  # include the terminal state 
-        "t_idx_wyp": t_idx_wyp,
-    }
-
-    # try cvx (waypoint hopping only) 
-    sol_cvx = prob.ocp_cvx()
-    status_cvx = sol_cvx["status"]
-    if status_cvx not in OK_STATUS:
-        sol_dict.update({"status_cvx": status_cvx, "status_scp": "cvx_failed"})
-        return sol_dict
-    roe_cvx = sol_cvx["z"]["state"]
-    actions_cvx = sol_cvx["z"]["action"]
-
-    # SCP 
-    prob.zref = {"state": roe_cvx, "action": actions_cvx}
-    prob.sol_0 = {"z": prob.zref}
-    prob.generate_scaling(roe_cvx, actions_cvx)
-    
-    if obj_type == "feasibility":
-        prob.type = "feasibility"
-        prob._cvx_built_AL = False; prob.update_flag = True
-    
-    sol_scp, _ = solve_scvx(prob)
-    status_scp = sol_scp["status"]
-    if status_scp not in OK_STATUS:
-        rtn_cvx = prob.f_2rtn(roe_cvx, propagate_oe(oec0, tvec_sec))
-        rtn_cvx_ct = propagate_ct(roe_cvx, actions_cvx, propagate_oe(oec0, tvec_sec), tvec_sec, n=10)
-        sol_dict.update({"status_cvx": status_cvx, 
-                         "status_scp": status_scp,
-                         "prob": prob,
-                         "roe_cvx": roe_cvx,
-                         "actions_cvx": actions_cvx,
-                         "rtn_cvx": rtn_cvx,
-                         "rtn_cvx_ct": rtn_cvx_ct,
-                         })
-        return sol_dict
-
-    roe_scp = sol_scp["z"]["state"]
-    actions_scp = sol_scp["z"]["action"]
-    oec = propagate_oe(oec0, tvec_sec)
-    rtn_scp = prob.f_2rtn(roe_scp, oec)
-    _, _, rtn_scp_ct = propagate_ct(roe_scp, actions_scp, oec, tvec_sec, n=10)
-    
-    sol_dict.update({
-        "status_cvx": status_cvx,
-        "status_scp": status_scp,
-        "prob": prob,
-        "roe_scp": roe_scp,
-        "actions_scp": actions_scp,
-        "rtn_scp": rtn_scp,
-        "rtn_scp_ct": rtn_scp_ct,
-    })
-    return sol_dict
-
-
-def compute_obs_score(prob: NonConvexOCP, roe: np.ndarray) -> float:
-    oec = propagate_oe(prob.oe_i, prob.tvec_sec)
-    rtn = prob.f_2rtn(roe, oec)
-    ranges = np.linalg.norm(rtn[:, :3], axis=1)
-    koz_radius = float(np.atleast_1d(prob.koz_dim).ravel()[0])
-    threshold = koz_radius + 50.0
-
-    within = ranges <= threshold
-    if not np.any(within):
-        return 0.0
-    first_idx = int(np.argmax(within))
-    last_idx = int(len(within) - 1 - np.argmax(within[::-1]))
-    region = ranges[first_idx : last_idx + 1]
-    return float(-np.sum(region) / prob.n_time)
-
-
-def compute_metrics(prob: NonConvexOCP, roe: np.ndarray, actions: np.ndarray, rtn_ct: np.ndarray) -> Dict[str, float]:
-    fuel_dv = float(np.linalg.norm(actions, axis=1).sum())
-    transfer_time_sec = float(prob.tvec_sec[-1])
-    observation_score = compute_obs_score(prob, roe)
-
-    ranges_ct = np.linalg.norm(rtn_ct[:, :3], axis=1)
-    min_separation_m = float(np.min(ranges_ct))
-    koz_radius = float(np.atleast_1d(prob.koz_dim).ravel()[0])
-    safety_margin_m = float(min_separation_m - koz_radius)
-
-    return {
-        "fuel_dv": fuel_dv,
-        "transfer_time_sec": transfer_time_sec,
-        "observation_score": observation_score,
-        "safety_margin_m": safety_margin_m,
-    }
 
 
 def rank_det(candidates: List[Dict[str, Any]], intent_priority: Sequence[str]) -> Optional[int]:

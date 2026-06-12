@@ -91,7 +91,8 @@ Reusable v1 components:
 - behavior vocabulary and campaign graph: `src/parameters.py`,
 - graph and scenario sampling utilities: `work/datagen_wyp.py`,
 - explicit RAGES+ action schema and deterministic sampler: `src/parameters.py`, `src/rages_sampling.py`,
-- waypoint model baseline training: `work/train_wyp_predictor.py`,
+- waypoint model library (`p_phi` config, featurization, GMM/VAE classes, decoding, checkpoint I/O, inference): `src/wyp_predictor.py`,
+- waypoint model baseline training script: `work/train_wyp_predictor.py`,
 - frozen-waypoint candidate rollout and SCP metric computation: `work/datagen_reasoning.py`,
 - reasoning SFT baseline: `work/train_reasoning_model.py`,
 - end-to-end smoke wrapper: `src/rages.py`.
@@ -240,7 +241,13 @@ where `w_hat` denotes waypoint constraints, passage constraints, or other SCP in
 
 ### 4.1.1 Repository baseline and target model class
 
-The current repository baseline is the conditional GMM/VAE waypoint filler in:
+The current repository baseline is the conditional GMM/VAE waypoint filler. The model library (config, featurization, model classes, `constrained_fill` decoding, checkpoint loading, and `predict_wyp_seq` inference) lives in:
+
+```text
+src/wyp_predictor.py
+```
+
+with the training loop kept as the script:
 
 ```text
 work/train_wyp_predictor.py
@@ -810,7 +817,7 @@ Recommended development order:
 2. Done: promote the existing scenario sampling logic in `work/datagen_wyp.py` into a deterministic scenario sampler with split metadata. The initial implementation is `src/rages_sampling.py`.
 3. Done: implement deterministic IR sampler for training. The implementation is in `src/rages_sampling.py` and samples structured `IR = (sigma, dz, g, filters)` without using raw text or an LLM.
 4. Implement hard filter and token/action mask builder using the existing graph-validity utilities as the first backend.
-5. Done: promote `generate_traj_with_wyp` and `compute_metrics` from `work/datagen_reasoning.py` into a thin SCP verifier wrapper with deterministic logging. The wrapper is `verify_waypoint_plan` in `src/rages_sampling.py`; scoring-side extraction helpers are in `src/rages_scoring.py`.
+5. Done: promote `generate_traj_with_wyp` and `compute_metrics` from `work/datagen_reasoning.py` into library modules. `generate_traj_with_wyp` now lives in `src/optimization/optimization.py`; `verify_waypoint_plan` in `src/rages_sampling.py` provides deterministic logging; metric/scoring helpers live in `src/rages_scoring.py`.
 6. Generate initial SCP rollout dataset using the current `work/datagen_wyp.py` workflow.
 7. Train the current GMM/VAE `p_phi` baseline using reward-weighted MLE.
 8. Train the RAGES+ flow-matching `p_phi` candidate and compare it against the GMM baseline.
@@ -1079,5 +1086,6 @@ Current validation status:
 | 2. Deterministic scenario sampler with split metadata | Done | Added `src/rages_sampling.py` with `SplitConfig`, `ScenarioSample`, `ScenarioRolloutSample`, `sample_curated_rollout`, and `sample_curated_rollouts`. |
 | 3. IR sampler | Done | Added IR dataclasses and deterministic training sampler in `src/rages_sampling.py`: `IRSigma`, `IRDeltaZ`, `IRGoal`, `IRFilters`, `IR`, `IRSample`, `sample_ir`, `sample_ir_batch`, and `enumerate_priority_profiles`. This sampler is structured and LLM-free; raw-text parsing remains a separate parser workstream. |
 | 4. Hard filter and token/action mask builder | Partial | IR-derived hard filter is the v0 pass-all placeholder `hard_filter_pass_all` in `src/rages_scoring.py` (cf. Sec. 3.1); grammar/admissibility stays with the behavior-graph sampler. Token/action mask builder not started. |
-| 5. SCP verifier wrapper with deterministic logging | Done (thin wrapper) | Added `WaypointPlan`, `SCPVerifierConfig`, `SCPVerifierResult`, and `verify_waypoint_plan` in `src/rages_sampling.py`. The wrapper lazy-loads the existing `generate_traj_with_wyp` SCP backend without changing solver behavior. Migrated `compute_obs_score` and `compute_metrics` into `src/rages_scoring.py`, alongside `verifier_metric_row`, `verifier_feasible`, and `verifier_scoring_inputs`, so verifier outputs can feed `rho_sigma`. |
+| 5. SCP verifier wrapper with deterministic logging | Done (thin wrapper) | Moved `generate_traj_with_wyp` into `src/optimization/optimization.py` as the library SCP execution helper. Added `WaypointPlan`, `SCPVerifierConfig`, `SCPVerifierResult`, and `verify_waypoint_plan` in `src/rages_sampling.py`; the wrapper imports the optimization helper directly and no longer needs `_load_scp_verifier_backend`. Migrated `compute_obs_score` and `compute_metrics` into `src/rages_scoring.py`, alongside `verifier_metric_row`, `verifier_feasible`, and `verifier_scoring_inputs`, so verifier outputs can feed `rho_sigma`. |
 | 13. External scoring `rho_sigma(Q)` | Done (v0) | Added `src/rages_scoring.py`: tolerance-based lexicographic ranking (`LexicographicPreference`, `lexicographic_key`, `rank_candidates`, `select_best`) with epsilon-bucket quantization for transitivity, plus `epsilons_from_metric_spread` for tolerance calibration (cf. Sec. 6.3). `eps = 0` recovers v1 `rank_det`. Consumes metric dicts + feasibility flag now; wiring to `Q_psi` outputs (`p_conv` threshold, metric means) pending Stage 2. Default epsilons are placeholders pending calibration on Stage 2 data. |
+| Prep for items 6--8: waypoint model library | Done (pure move) | Created `src/wyp_predictor.py` by moving code verbatim: `FillerConfig`, featurization (`build_input_from_data`, `build_input_slices`, ...), scaling/stats helpers, `ConditionalGMM`, `ConditionalVAE`, `masked_mdn_nll`, `constrained_fill`, `WypDataset` from `work/train_wyp_predictor.py`, and `load_model`, `build_data_from_values`, `predict_wyp_seq` from `work/datagen_reasoning.py`. The training script keeps only its training loop; importers (`src/rages.py`, `work/datagen_reasoning.py`, `work/analysis_rages.py`, `work/analysis_wyp_vs_random.py`) redirected. No functional changes; the flow-matching model class will be added to this module following the same `forward` / `compute_loss` / `sample_y` protocol. Validated: import smoke of all touched modules, v4 checkpoint load + `predict_wyp_seq`, and `python src/rages.py --idx 10` end-to-end. |

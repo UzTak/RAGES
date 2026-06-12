@@ -19,15 +19,17 @@ def find_root_path(path: str, word: str) -> str:
 
 ROOT_FOLDER = Path(__file__).resolve().parents[1]
 
-from datagen_reasoning import (  
+from datagen_reasoning import (
     generate_behavior_seq,
-    generate_traj_with_wyp,
     load_dataset,
+)
+from optimization.optimization import generate_traj_with_wyp
+from parameters import NODES, OK_STATUS
+from wyp_predictor import (
+    build_input_slices,
     load_model,
     predict_wyp_seq,
 )
-from parameters import NODES, OK_STATUS
-from train_wyp_predictor import build_input_slices  
 from datagen_wyp import _compute_reward  
 from utils import (
     behavior_seq_to_text,

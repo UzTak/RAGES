@@ -20,13 +20,13 @@ DEFAULT_REASONING_ADAPTER_DIR = ROOT_FOLDER / "model/reasoning_model/v2/checkpoi
 DEFAULT_WYP_CKPT_PATH = ROOT_FOLDER / "model/wyp_model/model_gmm_v3_weighted_one_hot.pt"
 DEFAULT_WYP_DATA_PATH = ROOT_FOLDER / "data/wyp_data/data_v3_discrete.pth"
 
-from datagen_reasoning import (
-    generate_traj_with_wyp,
+from datagen_reasoning import load_dataset
+from optimization.optimization import generate_traj_with_wyp
+from wyp_predictor import (
+    build_input_slices,
     load_model as load_wyp_model,
-    load_dataset,
     predict_wyp_seq,
 )
-from train_wyp_predictor import build_input_slices
 from utils import ReasoningSampler, to_jsonable
 
 

@@ -1161,5 +1161,133 @@ class NonConvexOCP():
         # reward‑to‑go 
         norms = np.linalg.norm(a, axis=2)                    # (n_data, T)
         rtg = -np.cumsum(norms[:, ::-1], axis=1)[:, ::-1]    # (n_data, T)
-            
+        
         return rtg
+
+
+def _restore_oec0_modified(oec0_mod: np.ndarray) -> np.ndarray:
+    oec0 = np.asarray(dyn.restore_koe(np.asarray(oec0_mod, dtype=float)), dtype=float).reshape(-1)
+    if oec0.shape != (6,):
+        raise ValueError(f"Restored OE must have shape (6,), got {oec0.shape}")
+    return oec0
+
+
+def _waypoint_times_from_dts(dt_seq, n_time: int):
+    total = float(np.sum(dt_seq))
+    cum = np.cumsum(list(dt_seq)[:-1]) / total
+    idx = np.rint(cum * (int(n_time) - 1)).astype(int)
+    idx = np.clip(idx, 1, int(n_time) - 2)
+
+    for i in range(1, len(idx)):
+        idx[i] = max(idx[i], idx[i - 1] + 1)
+
+    max_last = int(n_time) - 2
+    if len(idx) > 0 and idx[-1] > max_last:
+        overflow = idx[-1] - max_last
+        idx = idx - overflow
+        for i in range(len(idx)):
+            if idx[i] < 1:
+                idx[i] = 1
+            if i > 0 and idx[i] <= idx[i - 1]:
+                idx[i] = idx[i - 1] + 1
+        idx[-1] = min(idx[-1], max_last)
+
+    return idx.tolist()
+
+
+def generate_traj_with_wyp(
+    x0: np.ndarray,
+    x_pred: np.ndarray,
+    dt_pred: np.ndarray,
+    tof_steps: int,
+    koz_dim: np.ndarray,
+    artms: np.ndarray,
+    dt_sec: float,
+    oec0_mod: np.ndarray | None = None,
+    obj_type: str = "min_fuel",
+):
+    n_time = int(tof_steps) + 1
+    if n_time < 2:
+        return {"status_cvx": "invalid_tof", "status_scp": "invalid_tof"}
+
+    tvec_sec = np.arange(n_time, dtype=float) * float(dt_sec)
+    oec0 = _restore_oec0_modified(oec0_mod) if oec0_mod is not None else np.asarray(param.oec0, dtype=float)
+    t_idx_wyp = _waypoint_times_from_dts(list(dt_pred), n_time)
+    wyp = x_pred[:-1] if len(x_pred) > 1 else np.empty((0, 6))
+    goal = x_pred[-1] if len(x_pred) > 0 else x0
+
+    current_obs = {"state": x0, "goal": goal, "ttg": tvec_sec[-1], "dt": dt_sec, "oe": oec0}
+    prob = NonConvexOCP(
+        prob_definition={
+            "t_i": 0,
+            "t_f": n_time,
+            "tvec_sec": tvec_sec,
+            "chance": True,
+            "ct": False,
+            "current_obs": current_obs,
+            "waypoint_times": t_idx_wyp,
+            "waypoints": wyp,
+            "waypoint_type": "roe",
+            "koz_dim": koz_dim,
+            "artms_scale_range_1e3": artms,
+        }
+    )
+
+    sol_dict = {
+        "wyp": x_pred,
+        "t_idx_wyp": t_idx_wyp,
+    }
+
+    sol_cvx = prob.ocp_cvx()
+    status_cvx = sol_cvx["status"]
+    if status_cvx not in {"optimal", "optimal_inaccurate"}:
+        sol_dict.update({"status_cvx": status_cvx, "status_scp": "cvx_failed"})
+        return sol_dict
+    roe_cvx = sol_cvx["z"]["state"]
+    actions_cvx = sol_cvx["z"]["action"]
+
+    prob.zref = {"state": roe_cvx, "action": actions_cvx}
+    prob.sol_0 = {"z": prob.zref}
+    prob.generate_scaling(roe_cvx, actions_cvx)
+
+    if obj_type == "feasibility":
+        prob.type = "feasibility"
+        prob._cvx_built_AL = False
+        prob.update_flag = True
+
+    sol_scp, _ = solve_scvx(prob)
+    status_scp = sol_scp["status"]
+    if status_scp not in {"optimal", "optimal_inaccurate"}:
+        rtn_cvx = prob.f_2rtn(roe_cvx, dyn.propagate_oe(oec0, tvec_sec))
+        rtn_cvx_ct = dyn.propagate_ct(roe_cvx, actions_cvx, dyn.propagate_oe(oec0, tvec_sec), tvec_sec, n=10)
+        sol_dict.update(
+            {
+                "status_cvx": status_cvx,
+                "status_scp": status_scp,
+                "prob": prob,
+                "roe_cvx": roe_cvx,
+                "actions_cvx": actions_cvx,
+                "rtn_cvx": rtn_cvx,
+                "rtn_cvx_ct": rtn_cvx_ct,
+            }
+        )
+        return sol_dict
+
+    roe_scp = sol_scp["z"]["state"]
+    actions_scp = sol_scp["z"]["action"]
+    oec = dyn.propagate_oe(oec0, tvec_sec)
+    rtn_scp = prob.f_2rtn(roe_scp, oec)
+    _, _, rtn_scp_ct = dyn.propagate_ct(roe_scp, actions_scp, oec, tvec_sec, n=10)
+
+    sol_dict.update(
+        {
+            "status_cvx": status_cvx,
+            "status_scp": status_scp,
+            "prob": prob,
+            "roe_scp": roe_scp,
+            "actions_scp": actions_scp,
+            "rtn_scp": rtn_scp,
+            "rtn_scp_ct": rtn_scp_ct,
+        }
+    )
+    return sol_dict

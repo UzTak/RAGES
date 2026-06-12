@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from pathlib import Path
-import sys
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -30,7 +28,6 @@ METRIC_NAMES = tuple(DEFAULT_INTENT_PRIORITY)
 TASK_CLASSES = ("circumnav", "flyby", "ducking", "hold", "approach", "retreat")
 TERMINAL_DIRECTIONS = ("+V", "-V", "center")
 IR_PROFILES = ("balanced", "fuel_first", "time_first", "observation_first", "safety_first", "hard_filters")
-ROOT_FOLDER = Path(__file__).resolve().parents[1]
 
 
 @dataclass(frozen=True)
@@ -792,16 +789,6 @@ def sample_ir_batch(
     return out
 
 
-def _load_scp_verifier_backend():
-    work_folder = ROOT_FOLDER / "work"
-    if str(work_folder) not in sys.path:
-        sys.path.append(str(work_folder))
-    from datagen_reasoning import generate_traj_with_wyp
-    from rages_scoring import compute_metrics
-
-    return generate_traj_with_wyp, compute_metrics
-
-
 def verify_waypoint_plan(
     scenario: ScenarioSample,
     action: Action,
@@ -825,7 +812,9 @@ def verify_waypoint_plan(
             "Action b_seq length must match WaypointPlan waypoint_states length."
         )
 
-    generate_traj_with_wyp, compute_metrics = _load_scp_verifier_backend()
+    from optimization.optimization import generate_traj_with_wyp
+    from rages_scoring import compute_metrics
+
     solved = generate_traj_with_wyp(
         x0=np.asarray(scenario.x0, dtype=float),
         x_pred=np.asarray(waypoint_plan.waypoint_states, dtype=float),
