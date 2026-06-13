@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import sys
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
@@ -42,13 +41,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--obj-type", type=str, default="min_fuel")
     return parser.parse_args()
 
-
-def sha256_file(path: Path) -> str:
-    h = hashlib.sha256()
-    with open(path, "rb") as f:
-        for chunk in iter(lambda: f.read(1024 * 1024), b""):
-            h.update(chunk)
-    return h.hexdigest()
 
 
 def load_wyp_for_datagen(ckpt_path: Path) -> Tuple[Dict[str, Any], Dict[str, slice]]:
@@ -267,8 +259,7 @@ def main() -> None:
             "split_names": list(SPLIT_NAMES),
             "metric_keys": list(VERIFIER_METRIC_KEYS),
             "seed": int(args.seed),
-            "p_phi_checkpoint": str(args.p_phi_ckpt),
-            "p_phi_sha256": sha256_file(args.p_phi_ckpt),
+            "p_phi_checkpoint": args.p_phi_ckpt.name,
             "deterministic_decode": "use_mean_w=True",
             "scp_config": verifier_config.to_dict(),
             "converged_rows": n_conv,

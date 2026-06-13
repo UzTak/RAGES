@@ -93,10 +93,10 @@ class NonConvexOCP():
         self.chance = prob_definition.get('chance', False)
         self.ct = prob_definition.get('ct', False)
 
-        # default: load the safety paraemters for passive safety 
+        # Passive safety integration: recompute from actual per-problem oec0
         self.n_safe = param.n_safe
-        self.dt_safe_sec = param.dt_safe_sec   
-        self.t_safe_sec = self.n_safe * self.dt_safe_sec 
+        self.t_safe_sec = 1.0 * self.period
+        self.dt_safe_sec = self.t_safe_sec / self.n_safe
         self.tvec_safe_sec = np.linspace(0, self.t_safe_sec, self.n_safe)
         self.t_switch = prob_definition.get('t_switch', [])  # list of switch times for KOZ
 
