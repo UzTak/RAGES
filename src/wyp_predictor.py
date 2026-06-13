@@ -344,8 +344,11 @@ class ConditionalGMM(nn.Module):
         mu = out["mu"]
         std = out["std"]
         B, K, D = mu.shape
-        cat = torch.distributions.Categorical(probs=pi)
-        k = cat.sample()
+        if use_mean_w:
+            k = torch.argmax(pi, dim=-1)
+        else:
+            cat = torch.distributions.Categorical(probs=pi)
+            k = cat.sample()
         mu_k = mu[torch.arange(B), k]
         std_k = std[torch.arange(B), k]
         if use_mean_w:
@@ -400,6 +403,16 @@ class ConditionalVAE(nn.Module):
         self.kl_beta = float(cfg.kl_beta)
         self.last_kl = torch.tensor(0.0)
 
+    def _decode(self, cond: torch.Tensor, z_latent: torch.Tensor):
+        dec_in = torch.cat([cond, z_latent], dim=-1)
+        h_dec = self.decoder(dec_in)
+        w_mu = self.head_w_mean(h_dec)
+        w_logstd = self.head_w_logstd(h_dec)
+        w_logstd = torch.clamp(w_logstd, -0.9, 4.0)
+        w_std = torch.exp(w_logstd)
+        dt_alpha = torch.nn.functional.softplus(self.head_dt_alpha(h_dec)) + 1e-4
+        return w_mu, w_std, dt_alpha
+
     def forward(self, x_in, y=None, m=None):
         cond = build_cond_input(x_in, y, m, self.cfg)
 
@@ -411,14 +424,7 @@ class ConditionalVAE(nn.Module):
         eps = torch.randn_like(z_std)
         z_latent = z_mu + eps * z_std
 
-        dec_in = torch.cat([cond, z_latent], dim=-1)
-        h_dec = self.decoder(dec_in)
-        w_mu = self.head_w_mean(h_dec)
-        w_logstd = self.head_w_logstd(h_dec)
-        w_logstd = torch.clamp(w_logstd, -0.9, 4.0)
-        w_std = torch.exp(w_logstd)
-
-        dt_alpha = torch.nn.functional.softplus(self.head_dt_alpha(h_dec)) + 1e-4
+        w_mu, w_std, dt_alpha = self._decode(cond, z_latent)
 
         # KL(q(z|x,y_obs) || p(z))
         kl = 0.5 * torch.sum(torch.exp(z_logvar) + z_mu ** 2 - 1.0 - z_logvar, dim=-1)
@@ -485,18 +491,22 @@ class ConditionalVAE(nn.Module):
         dt_mode: str = "dirichlet_sample",
         use_mean_w: bool = False,
     ) -> torch.Tensor:
-        out = self.forward(x_in, y=y_in, m=m_known)
         w_split = cfg.max_phase * 6
-        mu = out["mu"][:, 0, :w_split]
-        std = out["std"][:, 0, :w_split]
         if use_mean_w:
+            cond = build_cond_input(x_in, y_in, m_known, self.cfg)
+            h = self.encoder(cond)
+            z_mu = self.head_z_mu(h)
+            mu, std, alpha = self._decode(cond, z_mu)
             w_sample = mu
         else:
+            out = self.forward(x_in, y=y_in, m=m_known)
+            mu = out["mu"][:, 0, :w_split]
+            std = out["std"][:, 0, :w_split]
+            alpha = out["dt_alpha"]
             eps = torch.randn_like(std)
             w_sample = mu + std * eps
 
-        alpha = out["dt_alpha"]
-        if dt_mode == "dirichlet_mean":
+        if use_mean_w or dt_mode == "dirichlet_mean":
             dt_frac = alpha / alpha.sum(dim=-1, keepdim=True).clamp_min(1e-8)
         else:
             dt_frac = torch.distributions.Dirichlet(alpha).sample()

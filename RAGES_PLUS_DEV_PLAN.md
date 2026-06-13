@@ -270,7 +270,8 @@ y = [x_seq, dt_seq]
 
 This is implemented as `ConditionalFlowMatcher` in `src/wyp_predictor.py`,
 following the same `forward` / `compute_loss` / `sample_y` protocol as the
-GMM/VAE baselines (training script pending, item 8).
+GMM/VAE baselines. `work/train_wyp_predictor.py` selects GMM, VAE, or flow
+with `--model-type`.
 
 where:
 
@@ -917,7 +918,7 @@ Current baseline workflow:
 
 ```text
 python work/datagen_wyp.py
-python work/train_wyp_predictor.py
+python work/train_wyp_predictor.py --model-type gmm --data-path data/wyp_data/data_v5.pth
 python work/analysis_wyp_vs_random.py
 ```
 
@@ -934,11 +935,11 @@ The GMM/VAE baseline should remain pinned as a reproducibility fixture before fl
 
 ### Stage 1 flow-matching validation
 
-New flow-matching workflow should mirror the existing waypoint scripts:
+Flow matching now uses the same waypoint training script and checkpoint format:
 
 ```text
-work/train_wyp_flow.py
-work/analysis_wyp_flow.py
+python work/train_wyp_predictor.py --model-type flow --data-path data/wyp_data/data_v5.pth
+python work/analysis_wyp_vs_random.py --ckpt-path model/wyp_model/<flow-checkpoint>.pt --data-path data/wyp_data/data_v5.pth
 ```
 
 Required metrics:
@@ -1095,8 +1096,8 @@ Current validation status:
 | 4. Hard filter and token/action mask builder | Partial | IR-derived hard filter is the v0 pass-all placeholder `hard_filter_pass_all` in `src/rages_scoring.py` (cf. Sec. 3.1); grammar/admissibility stays with the behavior-graph sampler. Token/action mask builder not started. |
 | 5. SCP verifier wrapper with deterministic logging | Done (thin wrapper) | Moved `generate_traj_with_wyp` into `src/optimization/optimization.py` as the library SCP execution helper. Added `WaypointPlan`, `SCPVerifierConfig`, `SCPVerifierResult`, and `verify_waypoint_plan` in `src/rages_sampling.py`; the wrapper imports the optimization helper directly and no longer needs `_load_scp_verifier_backend`. Migrated `compute_obs_score` and `compute_metrics` into `src/rages_scoring.py`, alongside `verifier_metric_row`, `verifier_feasible`, and `verifier_scoring_inputs`, so verifier outputs can feed `rho_sigma`. |
 | 6. Initial SCP rollout dataset | Pipeline ready; full run pending | Rewrote `work/datagen_wyp.py` to use `sample_curated_rollout` + `verify_waypoint_plan` as the generation path. All rows (converged and failed) are retained: non-converged rows get `reward=0` and NaN metrics so they have zero weight in wyp training but are available for Q convergence-head training (cf. Sec. 5.4). Full 4-metric vector (`fuel_dv`, `transfer_time_sec`, `observation_score`, `safety_margin_m`) stored in a `(N, 4)` metrics tensor using the CT trajectory for `safety_margin_m`. Reward shift applied only to converged rows. Dataset saves to `data/wyp_data/data_v5.pth` with `seed` and `metric_keys` in meta. Smoke-tested at N=6: ~83% convergence, determinism confirmed, NaN/converged consistency verified. The production N=80k dataset has not been generated yet. |
-| 6--8. Waypoint model library prep | Done (pure move) | Created `src/wyp_predictor.py` by moving code verbatim: `FillerConfig`, featurization (`build_input_from_data`, `build_input_slices`, ...), scaling/stats helpers, `ConditionalGMM`, `ConditionalVAE`, `masked_mdn_nll`, `constrained_fill`, `WypDataset` from `work/train_wyp_predictor.py`, and `load_model`, `build_data_from_values`, `predict_wyp_seq` from `work/datagen_reasoning.py`. The training script keeps only its training loop; importers (`src/rages.py`, `work/datagen_reasoning.py`, `work/analysis_rages.py`, `work/analysis_wyp_vs_random.py`) redirected. No functional changes; the flow-matching model class will be added to this module following the same `forward` / `compute_loss` / `sample_y` protocol. Validated: import smoke of all touched modules, v4 checkpoint load + `predict_wyp_seq`, and `python src/rages.py --idx 10` end-to-end. |
-| 7--9. `p_phi` training and freeze path | Partial; script cleanup pending | `src/wyp_predictor.py` now supports `ConditionalGMM`, `ConditionalVAE`, and `ConditionalFlowMatcher` through the same `forward` / `compute_loss` / `sample_y` protocol, and `load_model()` already restores checkpoints by `model_type`. The remaining construction should be a small refactor of `work/train_wyp_predictor.py`, not a new training stack: expose `--model-type {gmm,vae,flow}`, paths, weighting, `K`, latent dimension, KL beta, and flow steps; add flow to the existing construction branch; guard debug logging that assumes `mu/std`; then train GMM/VAE/flow on `data_v5`, compare true-SCP metrics, and freeze the selected deterministic decode contract (`use_mean_w=True`). |
+| 6--8. Waypoint model library prep | Done | `src/wyp_predictor.py` contains `FillerConfig`, featurization (`build_input_from_data`, `build_input_slices`, ...), scaling/stats helpers, `ConditionalGMM`, `ConditionalVAE`, `ConditionalFlowMatcher`, `masked_mdn_nll`, `constrained_fill`, `WypDataset`, `load_model`, `build_data_from_values`, and `predict_wyp_seq`. All three model classes share the `forward` / `compute_loss` / `sample_y` protocol. Deterministic `use_mean_w=True` decode is now defined for all three families: GMM argmax-component mean, VAE latent-mean decoder with Dirichlet-mean dt, and flow zero-base ODE decode. Validated previously with import smoke of all touched modules, v4 checkpoint load + `predict_wyp_seq`, and `python src/rages.py --idx 10` end-to-end. |
+| 7--9. `p_phi` training and freeze path | Code path ready; production training/eval/freeze pending | `work/train_wyp_predictor.py` is now the shared GMM/VAE/flow training entry point. It exposes repo-local `--data-path` / `--out-dir`, `--model-type {gmm,vae,flow}`, weighted/unweighted IL, weight smoothing/clipping, `K`, latent dimension, KL beta, flow steps, batch/epoch/LR controls, fixed behavior vocabulary sizing, and smoke-test batch caps. Checkpoints record cfg, input slices, train args, dataset SHA-256, split ranges, and the deterministic decode contract (`use_mean_w=True`). Flow construction and diagnostics are smoke-tested on local `data_v4`. Remaining work is empirical: generate production `data_v5`, train GMM/VAE/flow on it, compare true-SCP metrics/diversity, and mark the selected checkpoint as frozen before production Stage 2 Q labels. |
 | 10. Parser workstream (Sec. 10) | Done (v0) | Added standalone text-to-IR parser in `src/rages_parser.py`, eval renderer/gold examples in `work/parser_eval_data.py`, CLI runner `work/parse_intent_to_ir.py`, and benchmark `work/analysis_parser.py`. The parser emits the same `IR` dataclasses as the sampler, completes partial priority orders with the schema-driven default tail, leaves `dz` unconstrained when no terminal intent is stated, and keeps raw text outside Stage 1--4 training. |
 | 10--12. Stage 2 Q stack | Done (v0 code path); production labels pending frozen `p_phi` | Added grouped scenario/action candidate generation (`sample_scenario`, `enumerate_policy_paths`, `sample_candidate_actions`), `work/datagen_q.py`, `src/rages_q.py`, `work/train_q.py`, and `work/analysis_q.py`. Q input is only `(s, a)`, Q output is `{p_conv, metric_means}`, convergence BCE trains on all rows, and metric MSE trains only on converged finite metrics. Validated with compile checks, tiny SCP-backed datagen smoke, 2-epoch train smoke, analysis fixture, and Q-scoring adapter smoke. |
 | 13. External scoring `rho_sigma(Q)` | Done (v0) | Added `src/rages_scoring.py`: tolerance-based lexicographic ranking (`LexicographicPreference`, `lexicographic_key`, `rank_candidates`, `select_best`) with epsilon-bucket quantization for transitivity, plus `epsilons_from_metric_spread` for tolerance calibration (cf. Sec. 6.3). `LexicographicPreference` now carries `p_conv_threshold`, and Q adapters (`q_metric_row`, `q_feasible`, `rank_q_candidates`, `select_best_q`) wire `Q_psi` outputs into the ranking path. Default epsilons are placeholders pending calibration on production Stage 2 data. |
